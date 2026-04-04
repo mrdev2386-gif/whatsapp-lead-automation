@@ -1,17 +1,54 @@
-import { create, Client, ev, NotificationLanguage, Message, MessageTypes } from '../src/index';
-import type { ChatId } from '../src/api/model/aliases';
-
+console.log("[BOOT] Script started");
+import { create, Client, ev, Message, MessageTypes } from '@open-wa/wa-automate';
+import type { ChatId } from '@open-wa/wa-automate';
+import * as dotenv from "dotenv";
 const fs = require('fs');
+const path = require('path');
 const axios = require('axios');
-const ON_DEATH = fn => process.on('exit', fn);
+const getPort = require('get-port');
+const { OpenAI } = require('openai');
+
+console.log("[BOOT] Modules loaded successfully");
+
 let globalClient: Client;
+let server: any;
 const express = require('express');
 const app = express();
 app.use(express.json({ limit: '200mb' }));
-require('dotenv').config();
-const PORT = 8082;
-const { OpenAI } = require('openai');
-const { google } = require('googleapis');
+
+// ─────────────────────────────────────────────────────────────────────────────
+// SESSION CONFIGURATION
+// ─────────────────────────────────────────────────────────────────────────────
+
+// Priority: CLI Arg > Environment Variable > Default
+const argSession = process.argv.find(arg => arg.startsWith('--session='));
+const SESSION_ID = (argSession ? argSession.split('=')[1] : process.env.SESSION_ID) || "9155604591";
+
+console.log(`[BOOT] Initializing session: ${SESSION_ID}`);
+
+// Ensure isolation folder exists
+const SESSION_DIR = path.join(process.cwd(), `wa-${SESSION_ID}`);
+if (!fs.existsSync(SESSION_DIR)) {
+  fs.mkdirSync(SESSION_DIR, { recursive: true });
+}
+
+dotenv.config(); // Root .env (common keys like OPENAI_API_KEY)
+// Also try to load from session-specific .env if it exists
+const sessionEnv = path.join(SESSION_DIR, '.env');
+if (fs.existsSync(sessionEnv)) {
+  dotenv.config({ path: sessionEnv, override: true });
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// PORT MAPPING
+// ─────────────────────────────────────────────────────────────────────────────
+function getPortForSession(sessionId: string): number {
+  // Simple deterministic port mapping: last 4 digits of sessionId + offset 8000
+  // If not a number, fallback to get-port random
+  const numericId = parseInt(sessionId.replace(/\D/g, '').slice(-4));
+  if (isNaN(numericId)) return 8080;
+  return 8000 + (numericId % 1000);
+}
 
 if (!process.env.OPENAI_API_KEY) {
   console.error("FATAL: OPENAI_API_KEY is missing from environment variables.");
@@ -22,10 +59,10 @@ const openai = new OpenAI({
   apiKey: process.env.OPENAI_API_KEY
 });
 
-const SPREADSHEET_ID = '1mrrOGWzNTp2YYXiY5BxnsvqM8g3BsfB1yIpbc5qMR3w';
 const ADMIN_NUMBER = process.env.ADMIN_NUMBER || "918073539824@c.us";
-const GOOGLE_SCRIPT_URL = process.env.GOOGLE_SCRIPT_URL || '';
-const SENT_LEADS_FILE = 'sentLeads.json';
+const SHEET_URL = process.env.SHEET_URL || '';
+const SENT_LEADS_FILE = path.join(SESSION_DIR, 'sentLeads.json');
+const LEADS_FILE = path.join(SESSION_DIR, 'leads.json');
 
 // ─────────────────────────────────────────────────────────────────────────────
 // TYPES
@@ -33,15 +70,17 @@ const SENT_LEADS_FILE = 'sentLeads.json';
 
 type Stage =
   | 'new'
-  | 'asked_interest'
   | 'interested'
-  | 'demo_sent'
-  | 'negotiating'
-  | 'confirm_start'
-  | 'closed'
-  | 'rejected';
+  | 'qualified'
+  | 'converted'
+  | 'asked_interest'    // internal
+  | 'demo_sent'         // internal
+  | 'negotiating'       // internal
+  | 'confirm_start'     // internal
+  | 'closed'            // final (mapped to converted)
+  | 'rejected';         // final
 
-type Category = 'hotel' | 'clinic' | 'unknown';
+type Category = 'hotel' | 'clinic' | 'website' | 'automation' | 'unknown';
 
 interface UserState {
   stage: Stage;
@@ -69,10 +108,31 @@ interface UserState {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// STATE STORE  (in-memory, keyed by WhatsApp chat ID)
+// PERSISTENT STATE STORE
 // ─────────────────────────────────────────────────────────────────────────────
 
-const userState: Record<string, UserState> = {};
+const STATE_FILE = path.join(SESSION_DIR, 'state.json');
+let userState: Record<string, UserState> = {};
+
+function loadState() {
+  if (fs.existsSync(STATE_FILE)) {
+    try {
+      userState = JSON.parse(fs.readFileSync(STATE_FILE, 'utf8'));
+      console.log(`[SESSION ${SESSION_ID}] State loaded (${Object.keys(userState).length} users)`);
+    } catch (e) {
+      console.error(`[SESSION ${SESSION_ID}] Failed to load state:`, e);
+      userState = {};
+    }
+  }
+}
+
+function saveState() {
+  try {
+    fs.writeFileSync(STATE_FILE, JSON.stringify(userState, null, 2), 'utf8');
+  } catch (e) {
+    console.error(`[SESSION ${SESSION_ID}] Failed to save state:`, e);
+  }
+}
 
 function getUser(chatId: string): UserState {
   if (!userState[chatId]) {
@@ -104,6 +164,8 @@ function getUser(chatId: string): UserState {
   userState[chatId].lastInteraction = Date.now();
   return userState[chatId];
 }
+
+loadState();
 
 // ─────────────────────────────────────────────────────────────────────────────
 // DELAY HELPER
@@ -148,6 +210,8 @@ function detectIntent(body: string): { intent: Intent; confidence: number } {
   else if (/(aapne msg|kaun|who are you|kya chahiye|kaise mila)/.test(t)) { intent = 'confusion'; conf = 85; }
   else if (/\b(hotel|booking|rooms?|resort|lodge)\b/.test(t)) { intent = 'category_hotel'; conf = 95; }
   else if (/\b(clinic|dentist|dental|doctor|patient|hospital)\b/.test(t)) { intent = 'category_clinic'; conf = 95; }
+  else if (/\b(website|portfolio|e-commerce|web site|site)\b/.test(t)) { intent = 'interest'; conf = 95; }
+  else if (/\b(automation|automate|bot|chatbot|workflow)\b/.test(t)) { intent = 'interest'; conf = 95; }
   else if (/(price|charge|cost|kitna|fees?|rate|paisa|rupee|\u20b9)/.test(t)) { intent = 'pricing'; conf = 90; }
   else if (/(^no$|nahi|nope|not interested|mat karo|band karo|stop)/.test(t)) { intent = 'rejection'; conf = 90; }
   else if (/(call|phone|baat karo|number do|contact karo)/.test(t)) { intent = 'confirm'; conf = 90; }
@@ -172,46 +236,48 @@ function getDynamicPricing(chatId: string): string {
   return "$700 one-time plus $200/month";
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// MESSAGES
-// ─────────────────────────────────────────────────────────────────────────────
-
-// ── Per-language message sets (no emojis, no "automation") ──────────────────
+// ── Per-language message sets ──────────────────
 const MSG_HI = {
-  hotelInitial: `Agar aap direct bookings increase karna chahte ho,\nto main aapke hotel ke liye custom booking system bana sakta hu.\n\nKya aap chahte ho main idea explain karu?`,
-  clinicInitial: `Agar aap patient inquiries increase karna chahte ho,\nto main aapke clinic ke liye system bana sakta hu.\n\nKya main aapko explain karu kaise kaam karega?`,
-  confirmCategory: `Just to confirm, belongs to which category? Hotel or Clinic?`,
+  intro: `Namaste! Main Digilinex team se hu.\nHum businesses ko automate aur grow karne me help karte hain.\n\nKya main aapke business ke liye best system suggest karu?`,
+  hotelInitial: `Agar aap direct bookings badhana chahte ho,\nto main aapke hotel ke liye custom booking system bana sakta hu.\n\nKya main idea explain karu?`,
+  clinicInitial: `Agar aap patient inquiries badhana chahte ho,\nto main aapke clinic ke liye appointment system bana sakta hu.\n\nShall I explain how it works?`,
+  websiteInitial: `Hum professional websites aur automation solutions banate hain.\nKya aap apne business ko online scale karna chahte hain?`,
+  automationInitial: `Hum custom WhatsApp automation systems banate hain jo 24/7 leads close karte hain.\nKya main aapko demo dikhau?`,
+  confirmCategory: `Just to confirm, aapka business kis category me hai? Hotel, Clinic, ya Website/Automation?`,
   explanation: `Ye system aapko direct customers laata hai.\nDemo check karein: https://anjali-booking-system--cryptosourav23.replit.app/`,
-  microFollowUp: `Did you get a chance to check the demo?`,
-  lowInterest: `Do you want me to explain more or proceed with setup?`,
-  fastClose: `Should I set this up for you?`,
-  trustBoost: `This system is already working for other businesses.`,
+  microFollowUp: `Kya aapne hamara demo check kiya?`,
+  lowInterest: `Kya aap aur details chahte hain ya directly setup shuru karein?`,
+  fastClose: `Shall I set this up for you?`,
+  trustBoost: `Ye system multiple businesses me successfully chal raha hai.`,
   closePush: `Kya aap setup start karna chahte ho?`,
-  price: `Digilinex team aapse shortly connect karegi regarding pricing.`,
-  followUp1: `Just checking.\n\nKya aap apne business ke liye\ndirect booking system setup karna chahte ho?`,
-  followUp2: `Agar aap abhi start karte ho,\nto main aapko special setup offer de sakta hu.\n\nKya main aapke liye bana du?`,
-  followUp3: `Last check. Kya hum setup proceed karein?\nNahi to main ye offer close kar raha hu.`,
-  closed: `Okay.\n\nDigilinex team aapse connect kar rahi hai.`,
-  rejected: `Theek hai. Agar future me kabhi zarurat ho to zarur batayein.`,
+  price: `Digilinex team aapse pricing ke liye shortly connect karegi.`,
+  followUp1: `Just checking.\nKya aap apne business ke liye custom system setup karna chahte ho?`,
+  followUp2: `Agar aap abhi start karte ho, to hum aapko special setup offer de sakte hain.\nKya main aage badhu?`,
+  followUp3: `Last call. Kya hum setup proceed karein? Warna main ye offer close kar raha hu.`,
+  closed: `Theek hai!\nDigilinex team aapse details ke liye connect kar rahi hai.`,
+  rejected: `Theek hai. Agar future me zarurat ho to batayein.`,
   fallback: `Digilinex team aapse jaldi hi connect karegi.`,
   nonText: `Please wait, Digilinex team will contact you shortly.`,
 };
 
 const MSG_EN = {
+  intro: `Hello! I am from the Digilinex team.\nWe help businesses automate and grow efficiently.\n\nShall I suggest the best system for your business?`,
   hotelInitial: `If you want to increase direct bookings,\nI can build a custom booking system for your hotel.\n\nWould you like me to explain the idea?`,
   clinicInitial: `If you want to increase patient inquiries,\nI can build a system for your clinic.\n\nShall I explain how it works?`,
-  confirmCategory: `Just to confirm, are you a Hotel or a Clinic?`,
+  websiteInitial: `We build professional websites and automation solutions to scale your business.\nWould you like to see our portfolio?`,
+  automationInitial: `We build custom WhatsApp automation systems that close leads 24/7.\nShall I share a quick demo?`,
+  confirmCategory: `Just to confirm, are you a Hotel, Clinic, or looking for Website/Automation?`,
   explanation: `This system brings direct customers to you.\nDemo: https://anjali-booking-system--cryptosourav23.replit.app/`,
   microFollowUp: `Did you get a chance to check the demo?`,
   lowInterest: `Do you want me to explain more or proceed with setup?`,
   fastClose: `Should I set this up for you?`,
-  trustBoost: `This system is already working for other businesses.`,
+  trustBoost: `This system is already working for multiple businesses.`,
   closePush: `Would you like to start the setup?`,
   price: `The Digilinex team will connect with you shortly regarding pricing.`,
-  followUp1: `Just checking.\n\nDo you want to setup a\ndirect booking system for your business?`,
-  followUp2: `If you start now,\nI can give you a special setup offer.\n\nShall I build it for you?`,
-  followUp3: `Last checking call. Shall we proceed?\nOtherwise, I will close this setup offer.`,
-  closed: `Okay.\n\nThe Digilinex team is connecting with you.`,
+  followUp1: `Just checking.\nDo you want to setup a direct booking system for your business?`,
+  followUp2: `If you start now, I can give you a special setup offer.\nShall I build it for you?`,
+  followUp3: `Last checking call. Shall we proceed? Otherwise, I will close this setup offer.`,
+  closed: `Understood!\nThe Digilinex team is connecting with you.`,
   rejected: `Understood. Feel free to reach out whenever you need help.`,
   fallback: `The Digilinex team will connect with you shortly.`,
   nonText: `Please wait, Digilinex team will contact you shortly.`,
@@ -237,83 +303,73 @@ function M(body: string): typeof MSG_EN {
 // ─────────────────────────────────────────────────────────────────────────────
 // CRM — LEAD CAPTURE
 // ─────────────────────────────────────────────────────────────────────────────
-const LEADS_FILE = 'leads.json';
-
-async function saveToGoogleSheet(lead: any) {
-  try {
-    if (!fs.existsSync('credentials.json')) {
-      console.log('[CRM] Skip Sheets: credentials.json not found');
-      return;
-    }
-    const auth = new google.auth.GoogleAuth({
-      keyFile: 'credentials.json',
-      scopes: ['https://www.googleapis.com/auth/spreadsheets'],
-    });
-    const sheets = google.sheets({ version: 'v4', auth });
-    await sheets.spreadsheets.values.append({
-      spreadsheetId: SPREADSHEET_ID,
-      range: 'Sheet1!A:G',
-      valueInputOption: 'USER_ENTERED',
-      requestBody: {
-        values: [[
-          lead.time,
-          lead.number,
-          lead.message,
-          lead.stage,
-          lead.category,
-          lead.score,
-          lead.status
-        ]],
-      },
-    });
-    console.log('[CRM] Logged to Google Sheet successfully');
-  } catch (err: any) {
-    console.error('[CRM] Google Sheets Error:', err.message);
-  }
-}
 
 async function markLeadAsHot(client: Client, chatId: string, score: number) {
+  const sid = `[SESSION ${SESSION_ID}]`;
   await client.sendText(ADMIN_NUMBER as ChatId,
-    "🔥 HOT LEAD ALERT:\n" +
+    `${sid} 🔥 HOT LEAD ALERT:\n` +
     "Number: " + chatId + "\n" +
     "Score: " + score + "\n" +
     "Link: https://wa.me/" + chatId.split('@')[0]
   );
-  console.log(`[ALERT] Hot lead alert sent for ${chatId}`);
+  console.log(`${sid} [ALERT] Hot lead alert sent for ${chatId}`);
 }
 
-function saveLead(chatId: string, body: string, user: UserState): void {
-  // STEP 7: PREVENT DUPLICATES - Only log if stage or score changed significantly
-  if (user.lastLoggedStage === user.stage && user.lastLoggedScore === user.score) {
+interface Lead {
+  phone: string;
+  name: string;
+  message: string;
+  stage: string;
+  lastMessageTime: string;
+}
+
+function saveLead(chatId: string, body: string, user: UserState, name: string = ''): void {
+  const sid = `[SESSION ${SESSION_ID}]`;
+  
+  // Requirement: ignore if phone number is missing or invalid
+  if (!chatId || !chatId.endsWith('@c.us')) {
     return;
   }
 
-  const lead = {
-    number: chatId,
-    message: body,
-    stage: user.stage,
-    category: user.category,
-    score: user.score,
-    status: user.score >= 70 ? 'HOT' : 'COLD',
-    time: new Date().toISOString(),
-  };
+  // Requirement: ignore duplicate messages from same number
+  if (user.lastSentMsg === body) {
+    console.log(`${sid} [CRM] Duplicate message ignored for ${chatId}`);
+    return;
+  }
 
-  console.log('LEAD:', lead);
-  saveToGoogleSheet(lead);
-
-  user.lastLoggedStage = user.stage;
-  user.lastLoggedScore = user.score;
+  const phone = chatId.split('@')[0];
+  const lastMessageTime = new Date().toISOString();
 
   try {
-    let leads: object[] = [];
+    let leads: Lead[] = [];
     if (fs.existsSync(LEADS_FILE)) {
       const raw = fs.readFileSync(LEADS_FILE, 'utf8').trim();
       leads = raw ? JSON.parse(raw) : [];
     }
-    leads.push(lead);
+
+    // Requirement: Lead Deduplication (Phone as unique ID)
+    const existingIndex = leads.findIndex(l => l.phone === phone);
+    const newLead: Lead = {
+      phone,
+      name: name || "User",
+      message: body,
+      stage: user.stage,
+      lastMessageTime
+    };
+
+    if (existingIndex > -1) {
+      // Update existing lead
+      leads[existingIndex] = { ...leads[existingIndex], ...newLead };
+      // console.log(`${sid} [CRM] Lead updated: ${phone}`);
+    } else {
+      // Create new lead
+      leads.push(newLead);
+      console.log(`${sid} [CRM] Lead saved: ${phone}`);
+    }
+
     fs.writeFileSync(LEADS_FILE, JSON.stringify(leads, null, 2), 'utf8');
-  } catch (err) {
-    console.error('[CRM] Failed to write lead:', err);
+  } catch (err: any) {
+    console.error(`${sid} [CRM] Failed to write lead:`, err.message);
   }
 }
 
@@ -329,58 +385,59 @@ function scheduleFollowUp(
   chatId: string,
   user: UserState
 ): void {
+  const sid = `[SESSION ${SESSION_ID}]`;
+  
   // Cancel any existing timer for this user first
   if (followUpTimers[chatId]) {
     clearTimeout(followUpTimers[chatId]);
     delete followUpTimers[chatId];
   }
 
-  if (user.stage === 'closed' || user.status === 'DEAD') return;
+  // Requirement: Cancel followup if user replies (handled by the caller of this function)
+  // Requirement: Ensure no duplicate followups (handled by clearing existing timer)
+  
+  if (user.stage === 'closed' || user.status === 'DEAD' || user.humanEscalated) return;
 
   const msgSet = user.language === 'en' ? MSG_EN : MSG_HI;
 
-  // STEP 7: MICRO FOLLOW-UP (30 minutes after demo)
-  if (user.stage === 'demo_sent') {
-    followUpTimers[chatId] = setTimeout(async () => {
-      if (userState[chatId]?.stage === 'demo_sent' && userState[chatId]?.status === 'ACTIVE') {
-        try {
-          await client.sendText(chatId as ChatId, msgSet.microFollowUp);
-          console.log(`[MICRO-FOLLOWUP] Sent to ${chatId}`);
-        } catch (e) {}
-      }
-    }, 30 * 60 * 1000);
-    return;
-  }
+  // Requirement: Scheduled followups (5 minutes, 1 hour, 24 hours)
+  let delayMs = 0;
+  if (user.followUpCount === 0) delayMs = 5 * 60 * 1000;      // 5 mins
+  else if (user.followUpCount === 1) delayMs = 60 * 60 * 1000;   // 1 hour
+  else if (user.followUpCount === 2) delayMs = 24 * 60 * 60 * 1000; // 24 hours
+  else return; // Max 3 followups
 
-  // STEP 5: OFFER CONTROL & FOLLOW-UP LADDER
   followUpTimers[chatId] = setTimeout(async () => {
-    if (userState[chatId]?.status === 'ACTIVE' && userState[chatId]?.stage !== 'closed') {
+    // Re-check state before sending
+    if (userState[chatId]?.status === 'ACTIVE' && 
+        userState[chatId]?.stage !== 'closed' && 
+        !userState[chatId]?.humanEscalated) {
       try {
         user.followUpCount += 1;
         
-        if (user.followUpCount === 1) {
-          await client.sendText(chatId as ChatId, msgSet.followUp1); // 24h
-        } else if (user.followUpCount === 2) {
-          await client.sendText(chatId as ChatId, msgSet.followUp2); // 48h (with offer)
-        } else if (user.followUpCount === 3) {
-          await client.sendText(chatId as ChatId, msgSet.followUp3); // 72h
-        } else if (user.followUpCount > 3) {
-          // STEP 6: DEAD LEAD SYSTEM
-          user.status = 'DEAD';
-          console.log(`[DEAD LEAD] Marked ${chatId}`);
-          return;
+        let followMsg = "";
+        if (user.followUpCount === 1) followMsg = msgSet.followUp1;
+        else if (user.followUpCount === 2) followMsg = msgSet.followUp2;
+        else if (user.followUpCount === 3) followMsg = msgSet.followUp3;
+
+        if (followMsg) {
+          await client.sendText(chatId as ChatId, followMsg);
+          console.log(`${sid} [FOLLOWUP] Scheduled followup sent to ${chatId} (count=${user.followUpCount})`);
+          saveState(); // Save updated followUpCount
+          
+          // Schedule next one if applicable
+          if (user.followUpCount < 3) {
+            scheduleFollowUp(client, chatId, user);
+          }
         }
-
-        console.log(`[FOLLOWUP-${user.followUpCount}] Sent to ${chatId}`);
-        scheduleFollowUp(client, chatId, user); // Reschedule for next ladder
-
-      } catch (err) {
-        console.error(`[FOLLOWUP] Failed for ${chatId}:`, err);
+      } catch (err: any) {
+        console.error(`${sid} [FOLLOWUP] Failed for ${chatId}:`, err.message);
       }
     }
-  }, 24 * 60 * 60 * 1000);
+  }, delayMs);
 
-  console.log(`[FOLLOWUP] Scheduled ladder for ${chatId} (count=${user.followUpCount})`);
+  // console.log(`${sid} [FOLLOWUP] Scheduled in ${delayMs / 1000 / 60}m for ${chatId}`);
+  console.log(`${sid} [FOLLOWUP] Followup scheduled for ${chatId} in ${Math.round(delayMs / 1000 / 60)} minutes`);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -409,11 +466,11 @@ async function runBulkOutreach(client: Client) {
   console.log('[BULK] Starting outreach...');
   
   // STEP 5: SELF CHAT SHEET CONTROL
-  let targetUrl = GOOGLE_SCRIPT_URL;
+  let targetUrl = SHEET_URL;
   try {
     const hostNum = await client.getHostNumber();
     const selfId = `${hostNum}@c.us`;
-    const messages = await client.loadAndGetAllMessagesInChat(selfId, true, false);
+    const messages = await client.loadAndGetAllMessagesInChat(selfId as any, true, false);
     const lastMsg = messages[messages.length - 1]?.body || '';
     if (lastMsg.startsWith('http')) {
       targetUrl = lastMsg.trim();
@@ -422,11 +479,31 @@ async function runBulkOutreach(client: Client) {
   } catch (e) {}
 
   if (!targetUrl) {
-    console.error('[BULK] No GOOGLE_SCRIPT_URL found.');
+    console.error('[BULK] No SHEET_URL found.');
     return;
   }
 
-  const leads = await axios.get(targetUrl).then(res => res.data).catch(() => []);
+  const response = await axios.get(targetUrl).catch(() => ({ data: '' }));
+  let leads: any[] = [];
+  
+  if (typeof response.data === 'string') {
+    // Parser for CSV from /export?format=csv
+    const lines = response.data.split(/\r?\n/).filter((line: string) => line.trim());
+    if (lines.length > 1) {
+      const headers = lines[0].toLowerCase().split(',').map((h: string) => h.trim());
+      leads = lines.slice(1).map((line: string) => {
+        const values = line.split(',').map((v: string) => v.trim());
+        const lead: any = {};
+        headers.forEach((h: string, i: number) => {
+          if (h && values[i]) lead[h] = values[i];
+        });
+        return lead;
+      });
+    }
+  } else if (Array.isArray(response.data)) {
+    leads = response.data;
+  }
+
   const sent = getSentLeads();
   let count = 0;
   let rotationCounter = 0;
@@ -759,33 +836,45 @@ async function sendSafe(
   client: Client,
   chatId: string,
   user: UserState,
-  text: string,
-  altText?: string
+  text: string
 ): Promise<void> {
+  const sid = `[SESSION ${SESSION_ID}]`;
+  
   // STEP 1: STRICT NO REPEAT SYSTEM
   if (user.lastReplies.includes(text)) {
-    const fallback = isEnglish(text)
-      ? "Please wait, Digilinex team will contact you shortly."
-      : "Please wait, Digilinex team will contact you shortly.";
-
-    await client.sendText(chatId as ChatId, fallback);
+    const fallback = "Please wait, Digilinex team will contact you shortly.";
+    if (user.lastSentMsg !== fallback) {
+       await client.sendText(chatId as ChatId, fallback);
+       user.lastSentMsg = fallback;
+    }
     user.humanEscalated = true;
     return;
   }
 
+  // Requirement: Anti-Spam / Anti-Ban delay (3-10 seconds random)
+  const waitTime = Math.floor(Math.random() * (10000 - 3000 + 1) + 3000);
+  // console.log(`${sid} [DELAY] Waiting ${waitTime/1000}s before sending to ${chatId}`);
+  await delay(waitTime);
+
   await client.sendText(chatId as ChatId, text);
+  console.log(`${sid} [REPLY] Sent to ${chatId}`);
 
   user.lastSentMsg = text;
   user.lastReplies.push(text);
   if (user.lastReplies.length > 5) {
     user.lastReplies.shift();
   }
+  saveState();
 }
 
-async function askGpt(body: string, history: string[], chatId: string): Promise<string> {
+async function askGpt(body: string, history: string[] = [], chatId: string): Promise<string> {
+  const sid = `[SESSION ${SESSION_ID}]`;
   try {
     const pricing = getDynamicPricing(chatId);
     const isDetail = body.toLowerCase().includes('how it works') || body.toLowerCase().includes('kaise kaam karta hai');
+
+    // Requirement: Fix null history crash
+    const safeHistory = history || [];
 
     // STEP 4 & 5: GPT GUARDRAILS & TRUST BOOST
     const response = await openai.chat.completions.create({
@@ -802,7 +891,7 @@ async function askGpt(body: string, history: string[], chatId: string): Promise<
           5. If serious, push close. If confused, simplify. If rude, stay calm.
           6. ALWAYS end with: Would you like to proceed?`
         },
-        ...history.map(txt => ({ role: "assistant" as const, content: txt })),
+        ...safeHistory.map(txt => ({ role: "assistant" as const, content: txt })),
         { role: "user", content: body }
       ],
       max_tokens: isDetail ? 400 : 80,
@@ -812,7 +901,7 @@ async function askGpt(body: string, history: string[], chatId: string): Promise<
     let reply = response.choices[0].message.content || "";
     return reply;
   } catch (err: any) {
-    console.error("[GPT] Error:", err.message);
+    console.error(`${sid} [GPT] Error:`, err.message);
     return "Please wait, Digilinex team will contact you shortly.";
   }
 }
@@ -906,30 +995,38 @@ async function handleFAQOrFallback(
 }
 
 async function handleMessage(client: Client, message: Message): Promise<void> {
+  const sid = `[SESSION ${SESSION_ID}]`;
   const chatId = message.from;
   const body = (message.body || '').trim();
+  const name = message.sender?.pushname || message.sender?.name || "";
   const user = getUser(chatId);
   const { intent, confidence } = detectIntent(body);
-  const clusterMatch = matchFaqCluster(body);
   const msg = M(body);
   const currentIntent = intent as Intent;
 
   const stageBeforeReply = user.stage;
   user.messagesCount += 1;
-  saveLead(chatId, body, user);
+  user.lastInteraction = Date.now();
+  user.followUpCount = 0; // Requirement: Cancel/Restart followup ladder if user replies
+  
+  // Requirement: Use single codebase and proper lead storage
+  saveLead(chatId, body, user, name);
 
-  console.log(`\n[BOT] ──────────────────────────────────`);
-  console.log(`[BOT] body     : "${body}"`);
-  console.log(`[BOT] intent   : ${intent} (${confidence}%)`);
-  console.log(`[BOT] score    : ${user.score}`);
+  console.log(`\n${sid} [BOT] body     : "${body}"`);
+  console.log(`${sid} [BOT] intent   : ${intent} (${confidence}%)`);
+  console.log(`${sid} [BOT] stage    : ${user.stage}`);
 
-  if (user.status === 'DEAD' || user.stage === 'closed') return;
+  if (user.status === 'DEAD' || user.stage === 'closed' || user.stage === 'converted') {
+    return;
+  }
 
-  // STEP 1: DM CONTEXT DETECTION & FALLBACK
+  // Requirement: Context + History Fix (Fix null history crash)
   if (user.category === 'unknown' && !user.categoryDetectedFromHistory) {
     try {
-      const messages = await client.loadAndGetAllMessagesInChat(chatId, false, false);
-      const userMessages = messages.filter(m => !m.fromMe).slice(-3);
+      // Fallback for null history
+      const history = await client.loadAndGetAllMessagesInChat(chatId, false, false).catch(() => []);
+      const safeHistory = history || [];
+      const userMessages = safeHistory.filter(m => !m.fromMe).slice(-3);
       const textToScan = (userMessages.map(m => (m.body || '')).join(' ') + ' ' + body).toLowerCase();
       
       let detected = false;
@@ -941,123 +1038,128 @@ async function handleMessage(client: Client, message: Message): Promise<void> {
         user.category = 'clinic';
         user.categoryDetectedFromHistory = true;
         detected = true;
+      } else if (/\b(website|portfolio|e-commerce)\b/.test(textToScan)) {
+        user.category = 'website';
+        user.categoryDetectedFromHistory = true;
+        detected = true;
+      } else if (/\b(automation|automate|bot|chatbot)\b/.test(textToScan)) {
+        user.category = 'automation';
+        user.categoryDetectedFromHistory = true;
+        detected = true;
       }
 
-      // STEP 1: WRONG CATEGORY FALLBACK
       if (!detected && user.stage === 'new') {
-        await client.sendText(chatId as ChatId, msg.confirmCategory);
+        const waitTime = Math.floor(Math.random() * (5000 - 2000 + 1) + 2000);
+        await delay(waitTime);
+        
+        // Requirement: greeting -> intro message
+        if (currentIntent === 'greeting') {
+          await client.sendText(chatId as ChatId, msg.intro);
+        } else {
+          await client.sendText(chatId as ChatId, msg.confirmCategory);
+        }
+        saveState();
         return;
       }
-    } catch (e) {
-      console.error('[CONTEXT] Failed to read history', e);
+    } catch (e: any) {
+      console.error(`${sid} [CONTEXT] Failed to read history:`, e.message);
     }
   }
 
-  // STEP 6: CLOSE CONDITION
+  // Requirement: Stage Management (Update stage based on replies)
   if (/(^ha$|^yes$|^ok$)/i.test(body.toLowerCase())) {
-    await client.sendText(chatId as ChatId, msg.closed);
-    user.stage = 'closed';
-    user.status = 'DEAD';
-    return;
+     if (user.stage === 'confirm_start') {
+        await client.sendText(chatId as ChatId, msg.closed);
+        user.stage = 'converted'; // Production mapping
+        user.status = 'DEAD';
+        console.log(`${sid} [STAGE] ${chatId} converted!`);
+        saveLead(chatId, body, user, name);
+        saveState();
+        return;
+     }
   }
 
-  // STEP 2: FAST CLOSE TRIGGER
-  if (/(^ok$|^hmm$|^batao$|^fine$)/i.test(body.toLowerCase())) {
-    await client.sendText(chatId as ChatId, msg.fastClose);
-    return;
-  }
-
-  // STEP 4: PRICE HANDLING
-  if (currentIntent === 'pricing') {
-    await client.sendText(chatId as ChatId, msg.price);
-    return;
-  }
-
-  // STEP 3: LOW INTEREST HANDLING
-  if (body.length < 5) {
-    user.shortReplyCount += 1;
-    if (user.shortReplyCount >= 2) {
-      await client.sendText(chatId as ChatId, msg.lowInterest);
-      user.shortReplyCount = 0;
-      return;
-    }
-  } else {
-    user.shortReplyCount = 0;
-  }
-
-  // ── REJECTION ──────────────────────────────────────────────────────────
   if (currentIntent === 'rejection') {
     await sendSafe(client, chatId, user, msg.rejected);
     user.stage = 'rejected';
+    saveState();
     return;
   }
 
-  // STEP 4: TRUST BOOST LINE (Random injection)
-  const shouldAddBoost = Math.random() < 0.25;
-
-  // ── STAGE MACHINE ────────────────────────────────────────────────────────
-  switch (user.stage) {
-    case 'new': {
-      if (user.category === 'hotel') {
-        let text = msg.hotelInitial;
-        if (shouldAddBoost) text += "\n\n" + msg.trustBoost;
-        await sendSafe(client, chatId, user, text);
-        user.stage = 'asked_interest';
-      } else if (user.category === 'clinic') {
-        let text = msg.clinicInitial;
-        if (shouldAddBoost) text += "\n\n" + msg.trustBoost;
-        await sendSafe(client, chatId, user, text);
-        user.stage = 'asked_interest';
-      } else {
-        // Fallback for confirming category
-        await sendSafe(client, chatId, user, msg.confirmCategory);
-      }
-      break;
-    }
-
-    case 'asked_interest': {
-      if (currentIntent === 'interest' || currentIntent === 'greeting') {
-        let text = msg.explanation;
-        if (shouldAddBoost) text = msg.trustBoost + "\n\n" + text;
-        await sendSafe(client, chatId, user, text);
-        user.stage = 'demo_sent';
-      } else {
-        await sendSafe(client, chatId, user, msg.fallback);
-      }
-      break;
-    }
-
-    case 'demo_sent': 
-    case 'interested': {
-      if (currentIntent === 'interest' || currentIntent === 'greeting') {
-        await sendSafe(client, chatId, user, msg.closePush);
-        user.stage = 'confirm_start';
-      } else {
-        await sendSafe(client, chatId, user, msg.fallback);
-      }
-      break;
-    }
-
-    case 'confirm_start': {
-      if (currentIntent === 'interest' || currentIntent === 'confirm') {
-        await client.sendText(chatId as ChatId, msg.closed);
-        user.stage = 'closed';
-        user.status = 'DEAD';
-      } else {
-        await sendSafe(client, chatId, user, msg.closePush);
-      }
-      break;
-    }
-
-    default: {
-      if (user.category === 'hotel') await sendSafe(client, chatId, user, msg.hotelInitial);
-      else if (user.category === 'clinic') await sendSafe(client, chatId, user, msg.clinicInitial);
-      user.stage = 'asked_interest';
-    }
+  if (currentIntent === 'pricing') {
+    await sendSafe(client, chatId, user, msg.price);
+    user.stage = 'interested';
+    saveState();
+    return;
   }
 
-  console.log(`[BOT] → stage: ${stageBeforeReply} → ${user.stage}`);
+  // FAQ / GPT Fallback handling
+  await handleFAQOrFallback(client, chatId, user, body, async () => {
+    // Stage Machine logic if FAQ doesn't handle it
+    const shouldAddBoost = Math.random() < 0.25;
 
+    switch (user.stage) {
+      case 'new': {
+        if (user.category === 'hotel') {
+          let text = msg.hotelInitial;
+          if (shouldAddBoost) text += "\n\n" + msg.trustBoost;
+          await sendSafe(client, chatId, user, text);
+          user.stage = 'interested';
+        } else if (user.category === 'clinic') {
+          let text = msg.clinicInitial;
+          if (shouldAddBoost) text += "\n\n" + msg.trustBoost;
+          await sendSafe(client, chatId, user, text);
+          user.stage = 'interested';
+        } else if (user.category === 'website') {
+          let text = msg.websiteInitial;
+          if (shouldAddBoost) text += "\n\n" + msg.trustBoost;
+          await sendSafe(client, chatId, user, text);
+          user.stage = 'interested';
+        } else if (user.category === 'automation') {
+          let text = msg.automationInitial;
+          if (shouldAddBoost) text += "\n\n" + msg.trustBoost;
+          await sendSafe(client, chatId, user, text);
+          user.stage = 'interested';
+        } else {
+          // fallback
+          await sendSafe(client, chatId, user, msg.confirmCategory);
+        }
+        break;
+      }
+
+      case 'interested': {
+        if (currentIntent === 'interest' || currentIntent === 'greeting') {
+          await sendSafe(client, chatId, user, msg.explanation);
+          user.stage = 'qualified';
+        } else {
+          await sendSafe(client, chatId, user, msg.fallback);
+        }
+        break;
+      }
+
+      case 'qualified': {
+        await sendSafe(client, chatId, user, msg.closePush);
+        user.stage = 'confirm_start';
+        break;
+      }
+
+      case 'confirm_start': {
+        await sendSafe(client, chatId, user, msg.closePush);
+        break;
+      }
+
+      default:
+        user.stage = 'new';
+        await sendSafe(client, chatId, user, msg.fallback);
+    }
+  });
+
+  if (user.stage !== stageBeforeReply) {
+    console.log(`${sid} [BOT] → stage: ${stageBeforeReply} → ${user.stage}`);
+    saveLead(chatId, body, user, name);
+  }
+
+  saveState();
   scheduleFollowUp(client, chatId, user);
 }
 
@@ -1065,16 +1167,54 @@ async function handleMessage(client: Client, message: Message): Promise<void> {
 // SESSION BOOTSTRAP
 // ─────────────────────────────────────────────────────────────────────────────
 
-ON_DEATH(async () => {
-  console.log('[EXIT] Killing session...');
-  if (globalClient) await globalClient.kill();
-});
+// ─────────────────────────────────────────────────────────────────────────────
+// SESSION BOOTSTRAP & GRACEFUL SHUTDOWN
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Handle graceful shutdown
+ */
+async function shutdown(signal: string) {
+  const sid = `[SESSION ${SESSION_ID}]`;
+  console.log(`\n${sid} [${signal}] Shutting down...`);
+  
+  if (globalClient) {
+    try {
+      await globalClient.kill();
+      console.log(`${sid} [SHUTDOWN] WhatsApp client closed.`);
+    } catch (e: any) {
+      console.error(`${sid} [SHUTDOWN] Error killing client:`, e.message);
+    }
+  }
+
+  if (server) {
+    server.close(() => {
+      console.log(`${sid} [SHUTDOWN] Express server closed.`);
+      process.exit(0);
+    });
+    // Force exit after 5s if server.close hangs
+    setTimeout(() => {
+      console.log(`${sid} [SHUTDOWN] Force exiting...`);
+      process.exit(1);
+    }, 5000);
+  } else {
+    process.exit(0);
+  }
+}
+
+process.on('SIGINT', () => shutdown('SIGINT'));
+process.on('SIGTERM', () => shutdown('SIGTERM'));
+
+// For "death" library if used elsewhere, but we handle it via process signals
+const ON_DEATH = (fn: any) => {
+  process.on('exit', fn);
+};
 
 ev.on('qr.**', async (qrcode, sessionId) => {
   const buf = Buffer.from(qrcode.replace('data:image/png;base64,', ''), 'base64');
-  const filename = `qr_code${sessionId ? '_' + sessionId : ''}.png`;
+  const filename = path.join(SESSION_DIR, `qr_code.png`);
   fs.writeFileSync(filename, buf);
-  console.log(`[QR] Saved → ${filename}  (scan with your phone)`);
+  console.log(`[QR ${sessionId}] Saved → ${filename} (scan with your phone)`);
 });
 
 ev.on('STARTUP.**', async (data, sessionId) => {
@@ -1082,38 +1222,122 @@ ev.on('STARTUP.**', async (data, sessionId) => {
 });
 
 async function start(client: Client): Promise<void> {
+  const sid = `[SESSION ${SESSION_ID}]`;
+  console.log(`${sid} Client started, wait for readiness signal...`);
+  
+  // Enforce wait for session settling and storage (120s hard delay for environment stabilization)
+  console.log(`${sid} Hardening session (120s wait — do NOT touch system)...`);
+  await delay(120000);
+
+  // Retry guard: attempt up to 3 times before giving up
+  let isValid = false;
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    try {
+      if (!client || !client.getHostNumber) {
+        console.log(`${sid} Retrying session init... (attempt ${attempt})`);
+        await delay(10000);
+        continue;
+      }
+      const isConn = await client.isConnected();
+      const host = await client.getHostNumber();
+      if (isConn && host) {
+        isValid = true;
+        console.log(`${sid} Session saved successfully. Host: ${host}`);
+        break;
+      }
+    } catch (e) {
+      console.warn(`${sid} Validation attempt ${attempt} failed, retrying...`);
+      await delay(5000);
+    }
+  }
+
+  if (!isValid) {
+    console.error(`${sid} Validation failed after 3 attempts! Restarting...`);
+    await client.kill();
+    process.exit(1);
+  }
+
+  const sessionId = process.env.SESSION_ID || "default";
   globalClient = client;
 
   app.use(client.middleware(true));
-  app.listen(PORT, () => console.log(`[HTTP] Listening on port ${PORT}`));
 
-  const me = await client.getMe();
-  console.log(`[ME] Host:`, me?.wid || me);
+  // PORT CONFLICT FIX & SAFE SERVER START
+  try {
+    const targetPort = getPortForSession(SESSION_ID);
+    const assignedPort = await getPort({ port: [targetPort, ...Array.from({ length: 50 }, (_, i) => 8000 + i)] });
+    
+    server = app.listen(assignedPort, () => {
+      console.log(`[SESSION ${SESSION_ID}] Running on port ${assignedPort} ✅`);
+    });
+
+    server.on('error', (err: any) => {
+      if (err.code === 'EADDRINUSE') {
+        console.error(`[SESSION ${SESSION_ID}] Port ${assignedPort} in use, retrying...`);
+      } else {
+        console.error(`[SESSION ${SESSION_ID}] Server error:`, err.message);
+      }
+    });
+
+  } catch (err: any) {
+    console.error(`[SESSION ${SESSION_ID}] FAILED to start server:`, err.message);
+  }
 
   client.onStateChanged(state => {
     console.log(`[STATE] ${state}`);
     if (state === 'CONFLICT' || state === 'UNLAUNCHED') client.forceRefocus();
   });
 
-  // Debug: log every message (in + out) without acting on it
-  client.onAnyMessage((msg: Message) => {
-    console.log(`[ANY] from=${msg.from} fromMe=${msg.fromMe} type=${msg.type} body="${msg.body}"`);
+  console.log(`${sid} STABLE READY ✅`);
+  
+  // Auto Self Test
+  try {
+    const me = await client.getHostNumber();
+    if (me) {
+      await client.sendText(`${me}@c.us` as any, "System Ready ✅");
+      console.log(`${sid} Self-test message sent to host.`);
+    }
+  } catch (e: any) {
+    console.error(`${sid} Self-test failed:`, e.message);
+  }
+
+  // ATTACH LISTENERS ONLY AFTER STABLE READY
+  console.log(`${sid} Attaching listeners...`);
+
+  // BASIC TEST HANDLER - responds to "hi" with "Working ✅"
+  client.onMessage(async (message: Message) => {
+    try {
+      if (message.fromMe) return;
+      if (message.body && message.body.toLowerCase() === "hi") {
+        console.log(`[SESSION ${SESSION_ID}] Test message received: hi`);
+        await client.sendText(message.from, "Working ✅");
+        console.log(`[SESSION ${SESSION_ID}] Test reply sent`);
+      }
+    } catch (err: any) {
+      console.error(`[SESSION ${SESSION_ID}] Test handler error:`, err.message);
+    }
   });
 
-  // Sales funnel: only fires for incoming messages (fromMe === false)
+  // SALES FUNNEL - only fires for incoming messages (fromMe === false)
   client.onMessage(async (message: Message) => {
-    // Hard guard — never process our own outgoing messages
-    if (message.fromMe) return;
+    try {
+      // Hard guard — never process our own outgoing messages
+      if (message.fromMe) return;
 
-    // Only handle plain text messages in the funnel
-    // Non-text types (image, audio, etc.) get a soft nudge
-    if (message.type !== MessageTypes.TEXT) {
-      await delay(3000);
-      await client.sendText(message.from, M(message.body || '').nonText);
-      return;
+      console.log(`[SESSION ${SESSION_ID}] Incoming:`, message.body);
+
+      // Only handle plain text messages in the funnel
+      // Non-text types (image, audio, etc.) get a soft nudge
+      if (message.type !== MessageTypes.TEXT) {
+        await delay(3000);
+        await client.sendText(message.from, M(message.body || '').nonText);
+        return;
+      }
+
+      await handleMessage(client, message);
+    } catch (err: any) {
+      console.error(`[SESSION ${SESSION_ID}] Error in onMessage:`, err.message);
     }
-
-    await handleMessage(client, message);
   });
 
   // Command System for Admin
@@ -1127,34 +1351,85 @@ async function start(client: Client): Promise<void> {
 
   client.onAddedToGroup(chat => console.log(`[GROUP] Added to: ${chat.id}`));
   client.onIncomingCall(call => console.log(`[CALL]  Incoming:`, call));
+
+  console.log(`${sid} Waiting for messages...`);
+
+  // Health Check Loop
+  setInterval(async () => {
+    try {
+      const ok = await client.isConnected();
+      if (!ok) {
+        console.warn(`${sid} Health Check: Connection lost!`);
+        await client.forceRefocus().catch(() => {});
+      }
+    } catch (e: any) {
+      console.warn(`${sid} Health Check: Error checking connection`, e.message);
+    }
+  }, 30000);
 }
 
-create({
-  sessionId: 'customer-support',
-  useChrome: true,
-  restartOnCrash: start,
-  headless: true,
-  throwErrorOnTosBlock: true,
-  qrTimeout: 0,
-  authTimeout: 0,
-  killProcessOnBrowserClose: true,
-  autoRefresh: true,
-  safeMode: true,
-  disableSpins: true,
-  multiDevice: true,
-  hostNotificationLang: NotificationLanguage.PTBR,
-  viewport: { height: 1200 },
-  popup: 3012,
-  defaultViewport: null,
-  protocolTimeout: 120000,
-  chromiumArgs: [
-    '--no-sandbox',
-    '--disable-setuid-sandbox',
-    '--disable-dev-shm-usage',
-    '--disable-gpu',
-    '--no-first-run',
-    '--no-zygote',
-  ],
-})
-  .then(client => start(client))
-  .catch(e => console.error(`[FATAL]`, e.message));
+// Prevent duplicate execution using a simple lock file
+const LOCK_FILE = path.join(SESSION_DIR, `.lock`);
+if (fs.existsSync(LOCK_FILE)) {
+  const pid = parseInt(fs.readFileSync(LOCK_FILE, 'utf8'));
+  try {
+    // Automatically detect and kill any existing node processes for same SESSION_ID
+    process.kill(pid, 0); 
+    console.log(`[SESSION ${SESSION_ID}] Found existing process ${pid}. Killing...`);
+    process.kill(pid, 'SIGKILL');
+    // Allow OS to reclaim resources
+    const startSync = Date.now();
+    while (Date.now() - startSync < 2000) {} 
+    fs.unlinkSync(LOCK_FILE);
+  } catch (e) {
+    // Process not running, stale lock
+    fs.unlinkSync(LOCK_FILE);
+  }
+}
+fs.writeFileSync(LOCK_FILE, process.pid.toString());
+
+process.on('exit', () => {
+  if (fs.existsSync(LOCK_FILE)) {
+    try {
+      fs.unlinkSync(LOCK_FILE);
+    } catch (e: any) {}
+  }
+});
+
+console.log(`[SESSION ${SESSION_ID}] Initializing browser...`);
+console.log("Creating client...");
+try {
+  create({
+    sessionId: SESSION_ID,
+    headless: false,
+    useChrome: true,
+    multiDevice: true,
+    restartOnCrash: true,
+    blockCrashLogs: true,
+    disableSpins: true,
+    qrTimeout: 0,
+    authTimeout: 120,
+    sessionDataPath: SESSION_DIR,
+    qrLogSkip: false,
+    popup: true,
+    args: [
+      '--disable-dev-shm-usage',
+      '--no-first-run',
+      '--no-default-browser-check',
+      '--disable-extensions',
+      '--disable-web-security',
+      '--disable-features=IsolateOrigins,site-per-process',
+    ],
+  })
+    .then(client => {
+      console.log(`[SESSION ${SESSION_ID}] Client initialized`);
+      return start(client);
+    })
+    .catch(e => {
+      console.error(`[SESSION ${SESSION_ID}] FAILED`, e.message);
+      console.error("[FATAL ERROR]", e);
+      if (fs.existsSync(LOCK_FILE)) fs.unlinkSync(LOCK_FILE);
+    });
+} catch (error) {
+  console.error("[FATAL ERROR] Outside of promise:", error);
+}
