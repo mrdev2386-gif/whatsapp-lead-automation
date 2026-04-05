@@ -5,8 +5,7 @@
 
 //Please see these docs: https://open-wa.github.io/wa-automate-nodejs/classes/client.html#middleware
 
-// import { create, Client, SimpleListener  } from '@open-wa/wa-automate';
-import { create, Client, SimpleListener } from '../src/index';
+import { create, Client, SimpleListener } from '@open-wa/wa-automate';
 
 const express = require('express');
 const app = express();
@@ -17,9 +16,14 @@ const PORT = 8082;
 const WEBHOOK_ADDRESS = 'PASTE_WEBHOOK_DOT_SITE_UNIQUE_URL_HERE'
 
 create({ sessionId:'session1'})
-  .then(async (client:Client) => {
+  .then(async (client: Client) => {
     app.use(client.middleware());
-    Object.keys(SimpleListener).map(eventKey=>client.registerWebhook(SimpleListener[eventKey],WEBHOOK_ADDRESS))
+    Object.keys(SimpleListener).forEach((eventKey: string) => {
+      const listener = SimpleListener[eventKey as keyof typeof SimpleListener];
+      if (typeof listener === 'string') {
+        client.registerWebhook(listener as SimpleListener, WEBHOOK_ADDRESS as any);
+      }
+    });
     app.listen(PORT, ()=>console.log(`\n• Listening on port ${PORT}!`));
   })
-  .catch(e=>console.log('Error',e.message));
+  .catch((e: any)=>console.log('Error',e.message));

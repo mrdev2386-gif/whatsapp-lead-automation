@@ -8,7 +8,10 @@
     "resolveJsonModule": true,
     "lib": ["ES2020", "DOM"],
     "moduleResolution": "node",
-    "ignoreDeprecations": "6.0"
+    "ignoreDeprecations": "6.0",
+    "outDir": "./dist",
+    "rootDir": "./"
   },
-  "include": ["index.ts"]
+  "include": ["*.ts"],
+  "exclude": ["node_modules", "dist"]
 }

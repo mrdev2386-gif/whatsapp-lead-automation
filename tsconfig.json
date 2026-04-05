@@ -8,9 +8,13 @@
     "resolveJsonModule": true,
     "lib": ["ES2020", "DOM"],
     "moduleResolution": "node",
-    "ignoreDeprecations": "5.0",
-    "rootDir": "demo",
-    "outDir": "demo"
+    "ignoreDeprecations": "6.0",
+    "rootDir": "./demo",
+    "outDir": "./demo/dist",
+    "declaration": true,
+    "declarationMap": true,
+    "sourceMap": true
   },
-  "include": ["demo/index.ts"]
+  "include": ["demo/**/*.ts"],
+  "exclude": ["node_modules", "dist"]
 }

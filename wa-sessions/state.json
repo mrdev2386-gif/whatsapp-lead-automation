@@ -1,0 +1,62 @@
+{
+  "919155604591@c.us": {
+    "stage": "closing",
+    "category": "hotel",
+    "lastInteraction": 1775369868281,
+    "lastSentMsg": "This is a one-time setup cost for the complete system including website, SEO, and lead generation.",
+    "lastReplies": [
+      "Price ₹5,000 – ₹10,000 depending on features.\n\nCall/WhatsApp: 916299261088\n\nDo you want me to set it up for you?",
+      "Price ₹5,000 – ₹10,000 depending on features.\n\nCall/WhatsApp: 916299261088\n\nDo you want me to set it up for you?",
+      "Price ₹5,000 – ₹10,000 depending on features.\n\nCall/WhatsApp: 916299261088\n\nDo you want me to set it up for you?",
+      "Price ₹5,000 – ₹10,000 depending on features.\n\nCall/WhatsApp: 916299261088\n\nDo you want me to set it up for you?",
+      "Price ₹5,000 – ₹10,000 depending on features.\n\nCall/WhatsApp: 916299261088\n\nDo you want me to set it up for you?"
+    ],
+    "currentFAQFlowId": "pricing",
+    "currentFAQStep": 4,
+    "humanEscalated": false,
+    "deepQuestionsCount": 12,
+    "language": "hi",
+    "score": 250,
+    "followUpDay": 0,
+    "lastLoggedStage": "",
+    "lastLoggedScore": -1,
+    "priority": false,
+    "messagesCount": 535,
+    "lastIntent": "",
+    "intentCount": 0,
+    "status": "DEAD",
+    "categoryDetectedFromHistory": true,
+    "shortReplyCount": 0,
+    "followUpCount": 0
+  },
+  "916299261088@c.us": {
+    "stage": "converted",
+    "category": "automation",
+    "lastInteraction": 1775369034876,
+    "lastSentMsg": "",
+    "lastReplies": [
+      "Please wait, Digilinex team will contact you shortly.",
+      "Just checking.\nKya aap apne business ke liye custom system setup karna chahte ho?",
+      "Understood. Feel free to reach out whenever you need help.",
+      "Bilkul! Chaliye shuru karte hain. Main aapka setup tayyar kar dunga.\n\nKya aap confirm karte ho?",
+      "Bilkul! Main aapka setup lock kar raha hu.\n\nHamari team aapko jaldi hi contact karega."
+    ],
+    "currentFAQFlowId": null,
+    "currentFAQStep": 0,
+    "humanEscalated": false,
+    "deepQuestionsCount": 4,
+    "language": "unknown",
+    "score": 60,
+    "followUpDay": 0,
+    "lastLoggedStage": "",
+    "lastLoggedScore": -1,
+    "priority": false,
+    "messagesCount": 16,
+    "lastIntent": "",
+    "intentCount": 0,
+    "status": "DEAD",
+    "categoryDetectedFromHistory": true,
+    "shortReplyCount": 0,
+    "followUpCount": 0
+  }
+}

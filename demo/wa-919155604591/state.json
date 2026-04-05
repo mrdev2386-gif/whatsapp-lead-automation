@@ -1,0 +1,28 @@
+{
+  "919867123558-1526211202@g.us": {
+    "stage": "new",
+    "category": "unknown",
+    "lastInteraction": 1775320985442,
+    "lastSentMsg": "Hamari specialized Digilinex team hamesha aapki personal madad ke liye ready hai.",
+    "lastReplies": [
+      "Hamari specialized Digilinex team hamesha aapki personal madad ke liye ready hai."
+    ],
+    "currentFAQFlowId": "human_contact",
+    "currentFAQStep": 1,
+    "humanEscalated": false,
+    "deepQuestionsCount": 1,
+    "language": "hi",
+    "score": 0,
+    "followUpDay": 0,
+    "lastLoggedStage": "",
+    "lastLoggedScore": -1,
+    "priority": false,
+    "messagesCount": 1,
+    "lastIntent": "",
+    "intentCount": 0,
+    "status": "ACTIVE",
+    "categoryDetectedFromHistory": false,
+    "shortReplyCount": 0,
+    "followUpCount": 0
+  }
+}

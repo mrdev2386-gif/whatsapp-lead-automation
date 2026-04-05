@@ -1,121 +1,139 @@
-# 🚀 QUICK REFERENCE - Environment Stabilization
+# 🔥 QUICK REFERENCE: SALES CLOSER FEATURES
 
-## ⚡ QUICK START
+## FEATURE 1: HARD CLOSE OVERRIDE
+**Trigger:** User says "price", "cost", "kitna"
+**Response:** Pricing + Setup offer + Close question
+**Stage:** → closing
 
-```bash
-# Windows
-setup.bat YOUR_SESSION_NUMBER
+## FEATURE 2: SCORE SYSTEM
+```
+interest    = +10
+pricing     = +20
+confirm     = +30
+demo_request= +15
+rejection   = -20
+```
 
-# Linux/Mac
-./setup.sh YOUR_SESSION_NUMBER
+## FEATURE 3: AUTO CLOSE TRIGGER
+**Trigger:** Score >= 40
+**Response:** \"Let's get this started. Confirm to proceed?\"
+**Stage:** → closing
 
-# Manual
-npm install puppeteer@19 --save-exact
-npm install
-node demo/index.js --session=YOUR_NUMBER
+## FEATURE 4: FINAL PAYMENT PUSH
+**Trigger:** Stage = closing + user confirms
+**Response:** \"I'm locking your setup. Team will contact you.\"
+**Stage:** → converted (DEAD)
+
+## FEATURE 5: URGENCY PUSH
+**Trigger:** Stage = interested + score > 20
+**Response:** \"Limited slots this week. Reserve one?\"
+**Effect:** Creates FOMO
+
+---
+
+## CONVERSATION FLOW
+
+```
+START (new)
+  ↓
+User shows interest (+10 score)
+  ↓
+User asks price (+20 score) → HARD CLOSE
+  ↓
+Score >= 40 → AUTO CLOSE TRIGGER
+  ↓
+User confirms → FINAL PAYMENT PUSH
+  ↓
+CONVERTED ✅
 ```
 
 ---
 
-## 📋 WHAT WAS FIXED
+## LOG INDICATORS
 
-| Issue | Fix | Status |
-|-------|-----|--------|
-| Session integrity check failed | 120s delay + Chrome flags | ✅ |
-| Browser sandbox conflicts | `--disable-features=IsolateOrigins,site-per-process` | ✅ |
-| CORS errors | `--disable-web-security` | ✅ |
-| Chrome crashes | `--disable-dev-shm-usage` | ✅ |
-| Puppeteer version conflicts | puppeteer@19.0.0 (exact) | ✅ |
+- `[SCORE] Hot lead detected!` = Auto-close triggered
+- `[CONVERTED] Lead closed!` = Deal locked
+- `[URGENCY] Sending limited slots` = FOMO activated
 
 ---
 
-## 🔧 CHANGES MADE
+## PRICING RULES
 
-### Code
-- Session delay: 90s → **120s**
-- Added 2 new Chrome flags
-
-### Dependencies
-- Added: `puppeteer@19.0.0` (exact)
-
-### Business Logic
-- **NO CHANGES** ✅
+Dynamic pricing based on country code:
+- India (91, 92): ₹25,000 one-time + ₹2,000/month
+- US/UAE (1, 971): $800 one-time + $200/month
+- Others: $700 one-time + $200/month
 
 ---
 
-## ✅ VERIFICATION
+## REPLY STYLE
 
-```bash
-# Check puppeteer
-npm list puppeteer
-# Should show: puppeteer@19.0.0
+✅ DO:
+- Short (1-3 lines)
+- Confident
+- Push decision
+- Hinglish tone
+- End with question
 
-# Test startup
-node demo/index.js --session=TEST
-# Should show: STABLE READY ✅ within 3 minutes
+❌ DON'T:
+- Long explanations
+- Support tone
+- Say "we will contact you"
+- Delay closing
+- Use emojis/symbols
 
-# Test message
-Send "hi" → expect "Working ✅"
+---
+
+## STAGE PROGRESSION
+
+new → interested → qualified → confirm_start → converted
+
+With scoring:
+- 0-20: Low interest
+- 20-40: Medium interest
+- 40+: HOT LEAD (auto-close)
+
+---
+
+## ADMIN COMMANDS
+
+Send to bot: `START BULK`
+→ Initiates bulk outreach from sheet
+
+---
+
+## ENVIRONMENT VARIABLES
+
+```
+OPENAI_API_KEY=sk-...
+SESSION_ID=9155604591
+SHEET_URL=https://...
+ADMIN_NUMBER=919999999999@c.us
 ```
 
 ---
 
-## ⚠️ CRITICAL REMINDERS
+## TESTING
 
-1. **Wait 2 full minutes** during startup
-2. **Don't touch keyboard/mouse** during stabilization
-3. **Ensure 1GB+ free RAM**
-4. **Close all Chrome instances** before starting
-5. **Use exact puppeteer@19** — don't upgrade
+Send these messages to test:
 
----
-
-## 📊 ENVIRONMENT CONFIG
-
-```
-Session Delay:        120s (2 minutes)
-Puppeteer Version:    19.0.0 (exact)
-Chrome Headless:      false
-Multi-Device:         true
-Restart on Crash:     true
-Auth Timeout:         120s
-Web Security:         Disabled
-Process Isolation:    Disabled
-```
+1. "Hi" → Greeting response
+2. "What's the price?" → HARD CLOSE
+3. "Interested" → Score +10
+4. "Yes, let's do it" → FINAL PUSH
+5. "No thanks" → Rejection (-20 score)
 
 ---
 
-## 🎯 EXPECTED BEHAVIOR
+## PERFORMANCE METRICS
 
-✅ Startup completes in ~3 minutes
-✅ "STABLE READY ✅" appears in logs
-✅ "hi" message gets "Working ✅" response
-✅ Sales funnel works normally
-✅ No "Session integrity check failed" errors
-
----
-
-## 🆘 TROUBLESHOOTING
-
-| Error | Solution |
-|-------|----------|
-| Session integrity check failed | Already fixed ✅ |
-| Chrome crashed | Already fixed ✅ |
-| Connection lost | Already fixed ✅ |
-| CORS errors | Already fixed ✅ |
-| Puppeteer mismatch | Already fixed ✅ |
+Track in logs:
+- Total leads: Check state.json
+- Converted: stage = 'converted'
+- Average score: Sum scores / count
+- Conversion rate: converted / total
 
 ---
 
-## 📁 FILES CREATED
-
-- `ENVIRONMENT_STABILIZATION.md` — Full guide
-- `ENVIRONMENT_FIXES_SUMMARY.md` — Detailed summary
-- `setup.bat` — Windows setup script
-- `setup.sh` — Linux/Mac setup script
-
----
-
-**Status:** ✅ COMPLETE
-**Ready:** YES
-**Production:** YES
+**Last Updated:** 2024
+**Status:** Production Ready ✅

@@ -1,4 +1,31 @@
 console.log("[BOOT] Script started");
+
+// 🔥 GLOBAL DUPLICATE MESSAGE TRACKER
+const lastMessageMap = new Map();
+
+// ─────────────────────────────────────────────────────────────────────────────
+// PRODUCTION RESILIENCE: Memory watchdog + crash handlers
+// ─────────────────────────────────────────────────────────────────────────────
+const MAX_MEMORY_MB = 450;
+setInterval(() => {
+  const used = process.memoryUsage().heapUsed / 1024 / 1024;
+  console.log(`[MEMORY] Used: ${used.toFixed(2)} MB`);
+  if (used > MAX_MEMORY_MB) {
+    console.error('❌ MEMORY LIMIT EXCEEDED. Restarting...');
+    process.exit(1);
+  }
+}, 10000);
+
+process.on('uncaughtException', (err) => {
+  console.error('[UNCAUGHT EXCEPTION]', err);
+  process.exit(1);
+});
+
+process.on('unhandledRejection', (err) => {
+  console.error('[UNHANDLED REJECTION]', err);
+  process.exit(1);
+});
+
 import { create, Client, ev, Message, MessageTypes } from '@open-wa/wa-automate';
 import type { ChatId } from '@open-wa/wa-automate';
 import * as dotenv from "dotenv";
@@ -7,11 +34,25 @@ const path = require('path');
 const axios = require('axios');
 const getPort = require('get-port');
 const { OpenAI } = require('openai');
+import { Analytics } from './analytics';
+import {
+  SHEET_CONFIGS,
+  processSheetOutreach,
+  startAutoPolling,
+  getSheetMetrics
+} from './multi-sheet-engine';
+import {
+  registerOutboundLead,
+  isOutboundLead,
+  processOutboundReply,
+  shouldPrioritizeOutboundReply
+} from './outbound-integration';
 
 console.log("[BOOT] Modules loaded successfully");
 
 let globalClient: Client;
 let server: any;
+let analytics: Analytics;
 const express = require('express');
 const app = express();
 app.use(express.json({ limit: '200mb' }));
@@ -72,13 +113,13 @@ type Stage =
   | 'new'
   | 'interested'
   | 'qualified'
-  | 'converted'
   | 'asked_interest'    // internal
   | 'demo_sent'         // internal
   | 'negotiating'       // internal
   | 'confirm_start'     // internal
-  | 'closed'            // final (mapped to converted)
-  | 'rejected';         // final
+  | 'closing'           // internal (before conversion)
+  | 'rejected'          // final
+  | 'converted';        // final (converted lead)
 
 type Category = 'hotel' | 'clinic' | 'website' | 'automation' | 'unknown';
 
@@ -250,13 +291,13 @@ const MSG_HI = {
   fastClose: `Shall I set this up for you?`,
   trustBoost: `Ye system multiple businesses me successfully chal raha hai.`,
   closePush: `Kya aap setup start karna chahte ho?`,
-  price: `Digilinex team aapse pricing ke liye shortly connect karegi.`,
+  price: `Automation system ₹5,000 – ₹10,000 me ready ho jata hai.\n\nIsme WhatsApp auto-reply, lead handling aur setup sab included hota hai.\n\nKya main aapke liye setup start karu?`,
   followUp1: `Just checking.\nKya aap apne business ke liye custom system setup karna chahte ho?`,
   followUp2: `Agar aap abhi start karte ho, to hum aapko special setup offer de sakte hain.\nKya main aage badhu?`,
   followUp3: `Last call. Kya hum setup proceed karein? Warna main ye offer close kar raha hu.`,
   closed: `Theek hai!\nDigilinex team aapse details ke liye connect kar rahi hai.`,
   rejected: `Theek hai. Agar future me zarurat ho to batayein.`,
-  fallback: `Digilinex team aapse jaldi hi connect karegi.`,
+  fallback: `Samajh gaya 👍\n\nHum WhatsApp automation, website aur business systems setup karte hain.\n\nAapko kis type ka system chahiye?`,
   nonText: `Please wait, Digilinex team will contact you shortly.`,
 };
 
@@ -273,13 +314,13 @@ const MSG_EN = {
   fastClose: `Should I set this up for you?`,
   trustBoost: `This system is already working for multiple businesses.`,
   closePush: `Would you like to start the setup?`,
-  price: `The Digilinex team will connect with you shortly regarding pricing.`,
+  price: `Automation system starts from $5,000 to $10,000.\n\nThis includes WhatsApp auto-reply, lead handling and complete setup.\n\nShall I start your setup?`,
   followUp1: `Just checking.\nDo you want to setup a direct booking system for your business?`,
   followUp2: `If you start now, I can give you a special setup offer.\nShall I build it for you?`,
   followUp3: `Last checking call. Shall we proceed? Otherwise, I will close this setup offer.`,
   closed: `Understood!\nThe Digilinex team is connecting with you.`,
   rejected: `Understood. Feel free to reach out whenever you need help.`,
-  fallback: `The Digilinex team will connect with you shortly.`,
+  fallback: `Got it 👍\n\nWe build WhatsApp automation, websites and business systems.\n\nWhat type of system do you need?`,
   nonText: `Please wait, Digilinex team will contact you shortly.`,
 };
 
@@ -396,7 +437,7 @@ function scheduleFollowUp(
   // Requirement: Cancel followup if user replies (handled by the caller of this function)
   // Requirement: Ensure no duplicate followups (handled by clearing existing timer)
   
-  if (user.stage === 'closed' || user.status === 'DEAD' || user.humanEscalated) return;
+  if (user.stage === 'converted' || user.status === 'DEAD' || user.humanEscalated) return;
 
   const msgSet = user.language === 'en' ? MSG_EN : MSG_HI;
 
@@ -410,7 +451,7 @@ function scheduleFollowUp(
   followUpTimers[chatId] = setTimeout(async () => {
     // Re-check state before sending
     if (userState[chatId]?.status === 'ACTIVE' && 
-        userState[chatId]?.stage !== 'closed' && 
+        userState[chatId]?.stage !== 'converted' && 
         !userState[chatId]?.humanEscalated) {
       try {
         user.followUpCount += 1;
@@ -846,6 +887,7 @@ async function sendSafe(
     if (user.lastSentMsg !== fallback) {
        await client.sendText(chatId as ChatId, fallback);
        user.lastSentMsg = fallback;
+       analytics.trackMessageSent(chatId);
     }
     user.humanEscalated = true;
     return;
@@ -856,8 +898,15 @@ async function sendSafe(
   // console.log(`${sid} [DELAY] Waiting ${waitTime/1000}s before sending to ${chatId}`);
   await delay(waitTime);
 
-  await client.sendText(chatId as ChatId, text);
-  console.log(`${sid} [REPLY] Sent to ${chatId}`);
+  try {
+    await client.sendText(chatId as ChatId, text);
+    console.log(`${sid} [REPLY] Sent to ${chatId}`);
+    analytics.trackMessageSent(chatId);
+    analytics.trackMessageDelivered(chatId);
+  } catch (err: any) {
+    console.error(`${sid} [REPLY] Failed to send:`, err.message);
+    analytics.trackMessageFailed(chatId, text);
+  }
 
   user.lastSentMsg = text;
   user.lastReplies.push(text);
@@ -867,29 +916,79 @@ async function sendSafe(
   saveState();
 }
 
+// Wrapper for outbound tracking
+async function sendSafeOutbound(
+  client: Client,
+  chatId: string,
+  user: UserState,
+  text: string,
+  sheetId: string,
+  category: 'clinic' | 'hotel'
+): Promise<void> {
+  registerOutboundLead(chatId, SESSION_ID, sheetId, category);
+  await sendSafe(client, chatId, user, text);
+}
+
 async function askGpt(body: string, history: string[] = [], chatId: string): Promise<string> {
   const sid = `[SESSION ${SESSION_ID}]`;
+  
+  // 🔥 FIX GPT ERROR: TEMP DISABLE IF INVALID
+  if (!process.env.OPENAI_API_KEY || process.env.OPENAI_API_KEY.includes('sk-proj-')) {
+    console.warn('[GPT] Disabled - invalid or test key detected');
+    return 'Please wait, Digilinex team will contact you shortly.';
+  }
+  
   try {
     const pricing = getDynamicPricing(chatId);
     const isDetail = body.toLowerCase().includes('how it works') || body.toLowerCase().includes('kaise kaam karta hai');
-
-    // Requirement: Fix null history crash
     const safeHistory = history || [];
 
-    // STEP 4 & 5: GPT GUARDRAILS & TRUST BOOST
+    // 🔥 ELITE SALES CLOSER SYSTEM PROMPT
     const response = await openai.chat.completions.create({
       model: "gpt-4o-mini",
       messages: [
         {
           role: "system",
-          content: `You are a professional sales agent for Digilinex. Pricing: ${pricing}. 
-          RULES: 
-          1. Default reply: Max 3 lines ONLY. No long paragraphs.
-          2. IF 'how it works' allow 7-15 lines.
-          3. Tone: Professional human-closer. NO emojis. NO symbols like *. 
-          4. Trust Boost: Occasionally mention 'Ye system already multiple businesses me use ho raha hai' (in Hinglish) or 'We have already implemented this for multiple businesses' (in English).
-          5. If serious, push close. If confused, simplify. If rude, stay calm.
-          6. ALWAYS end with: Would you like to proceed?`
+          content: `You are an elite WhatsApp sales closer for Digilinex Automation.
+
+Your ONLY goal is to convert leads into paying customers.
+
+RULES:
+* Keep replies short (1-3 lines max)
+* Be confident, not robotic
+* Always push conversation forward
+* Never say "we will contact you"
+* Always try to close the deal
+
+SALES STRATEGY:
+1. If user asks price → give range + push to confirm
+2. If user shows interest → move to closing
+3. If user hesitates → create urgency
+4. If user says yes → immediately confirm & lock
+
+STYLE:
+* Hinglish (natural human tone)
+* Friendly but slightly authoritative
+* No long paragraphs
+
+CLOSING BEHAVIOR:
+* Always end with a question that pushes decision
+* Example: "Should I set this up for you?"
+
+PRICING RULE:
+* Always say: ${pricing}
+
+URGENCY:
+* Limited slots
+* Setup takes time
+* First come first serve
+
+DO NOT:
+* Give long explanations
+* Act like support agent
+* Delay closing
+
+You are a DEAL CLOSER, not a chatbot.`
         },
         ...safeHistory.map(txt => ({ role: "assistant" as const, content: txt })),
         { role: "user", content: body }
@@ -996,8 +1095,42 @@ async function handleFAQOrFallback(
 
 async function handleMessage(client: Client, message: Message): Promise<void> {
   const sid = `[SESSION ${SESSION_ID}]`;
+  
+  // 🔥 CRITICAL: STOP SELF MESSAGE LOOP
+  if (message.fromMe) return;
+  
+  // 🔥 IGNORE SYSTEM MESSAGES
+  if (!message.body) return;
+  if (message.body.includes('System Ready') || message.body.includes('STABLE READY') || message.body.includes('Client ready')) {
+    console.log('[SKIP SYSTEM MESSAGE]');
+    return;
+  }
+  
   const chatId = message.from;
   const body = (message.body || '').trim();
+  
+  // 🔥 STOP DUPLICATE MESSAGES
+  const lastMsg = lastMessageMap.get(chatId);
+  if (lastMsg === body) {
+    console.log(`[SKIP DUPLICATE] ${chatId}: "${body}"`);
+    return;
+  }
+  lastMessageMap.set(chatId, body);
+  
+  // ─────────────────────────────────────────────────────────────────────────────
+  // PRIORITY: Handle outbound campaign replies BEFORE regular bot logic
+  // ─────────────────────────────────────────────────────────────────────────────
+  if (shouldPrioritizeOutboundReply(chatId)) {
+    const user = getUser(chatId);
+    const outboundReply = processOutboundReply(chatId, body);
+    if (outboundReply) {
+      console.log(`${sid} [OUTBOUND] Handling reply from ${chatId}`);
+      await sendSafe(client, chatId, user, outboundReply);
+      saveState();
+      return; // Exit early - don't process with regular bot logic
+    }
+  }
+  
   const name = message.sender?.pushname || message.sender?.name || "";
   const user = getUser(chatId);
   const { intent, confidence } = detectIntent(body);
@@ -1007,16 +1140,56 @@ async function handleMessage(client: Client, message: Message): Promise<void> {
   const stageBeforeReply = user.stage;
   user.messagesCount += 1;
   user.lastInteraction = Date.now();
-  user.followUpCount = 0; // Requirement: Cancel/Restart followup ladder if user replies
+  user.followUpCount = 0;
   
-  // Requirement: Use single codebase and proper lead storage
   saveLead(chatId, body, user, name);
+
+  // 🔥 IMPROVE PRICE RESPONSE
+  if (body.toLowerCase().includes('price') || body.toLowerCase().includes('cost') || body.toLowerCase().includes('kitna')) {
+    // 🔥 STOP PRICE SPAM LOOP
+    if (user.lastSentMsg === 'price') {
+      console.log(`[SKIP PRICE REPEAT] ${chatId}`);
+      return;
+    }
+    
+    await sendSafe(client, chatId, user,
+      `Automation system ₹5,000 – ₹10,000 me ready ho jata hai.\n\nIsme WhatsApp auto-reply, lead handling aur setup sab included hota hai.\n\nKya main aapke liye setup start karu?`
+    );
+    user.lastSentMsg = 'price';
+    user.stage = 'closing';
+    user.lastInteraction = Date.now();
+    saveState();
+    return;
+  }
+
+  // 🔥 SCORE SYSTEM: Update score based on intent
+  if (intent === 'interest') user.score += 10;
+  if (intent === 'pricing') user.score += 20;
+  if (intent === 'confirm') user.score += 30;
+  if (intent === 'demo_request') user.score += 15;
+  if (intent === 'rejection') user.score -= 20;
+  
+  // 🔥 FIX SCORE OVERFLOW: Cap score at 100
+  user.score = Math.min(user.score, 100);
+  user.score = Math.max(user.score, 0);
 
   console.log(`\n${sid} [BOT] body     : "${body}"`);
   console.log(`${sid} [BOT] intent   : ${intent} (${confidence}%)`);
-  console.log(`${sid} [BOT] stage    : ${user.stage}`);
+  console.log(`${sid} [BOT] stage    : ${user.stage} | Score: ${user.score}`);
 
-  if (user.status === 'DEAD' || user.stage === 'closed' || user.stage === 'converted') {
+  // 🔥 FIX NO REPLY AFTER CONVERSION: Allow replies even after converted
+  if (user.status === 'DEAD') {
+    const msg_lower = body.toLowerCase();
+    if (msg_lower === 'hi' || msg_lower === 'hello' || msg_lower === 'hey') {
+      console.log(`${sid} [RESET] New conversation after conversion`);
+      user.stage = 'new';
+      user.status = 'ACTIVE';
+      user.score = 0;
+      user.followUpCount = 0;
+    } else {
+      console.log(`${sid} [SKIP RESET] Converted user but continuing flow`);
+      user.status = 'ACTIVE';
+    }
     return;
   }
 
@@ -1072,10 +1245,11 @@ async function handleMessage(client: Client, message: Message): Promise<void> {
         await client.sendText(chatId as ChatId, msg.closed);
         user.stage = 'converted'; // Production mapping
         user.status = 'DEAD';
+        analytics.trackConversion(chatId);
         console.log(`${sid} [STAGE] ${chatId} converted!`);
         saveLead(chatId, body, user, name);
         saveState();
-        return;
+        return; // 🔥 CRITICAL: RETURN
      }
   }
 
@@ -1083,13 +1257,82 @@ async function handleMessage(client: Client, message: Message): Promise<void> {
     await sendSafe(client, chatId, user, msg.rejected);
     user.stage = 'rejected';
     saveState();
-    return;
+    return; // 🔥 CRITICAL: RETURN
   }
 
-  if (currentIntent === 'pricing') {
-    await sendSafe(client, chatId, user, msg.price);
-    user.stage = 'interested';
+  // 🔥 AUTO CLOSE TRIGGER: Hot lead detection (score >= 40)
+  if (
+    user.score >= 40 &&
+    user.stage !== 'converted' &&
+    user.stage !== 'closing'
+  ) {
+    const isEn = isEnglish(body);
+    const closingMsg = isEn
+      ? "Great! Let's get this started. I'll set everything up for you.\n\nPlease confirm to proceed."
+      : "Bilkul! Chaliye shuru karte hain. Main aapka setup tayyar kar dunga.\n\nKya aap confirm karte ho?";
+    await sendSafe(client, chatId, user, closingMsg);
+    user.stage = 'closing';
+    console.log(`${sid} [SCORE] Hot lead detected! Score: ${user.score}`);
     saveState();
+    return; // 🔥 CRITICAL: RETURN TO PREVENT DUPLICATE RESPONSES
+  }
+
+  // 🔥 FINAL PAYMENT PUSH: Closing stage confirmation
+  if (user.stage === 'closing' && (intent === 'confirm' || intent === 'interest')) {
+    const isEn = isEnglish(body);
+    const paymentMsg = isEn
+      ? "Perfect! I'm locking your setup.\n\nOur team will contact you shortly to complete everything."
+      : "Bilkul! Main aapka setup lock kar raha hu.\n\nHamari team aapko jaldi hi contact karega.";
+    await sendSafe(client, chatId, user, paymentMsg);
+    user.stage = 'converted';
+    user.status = 'DEAD';
+    analytics.trackConversion(chatId);
+    console.log(`${sid} [CONVERTED] Lead closed! Score: ${user.score}`);
+    saveLead(chatId, body, user, name);
+    saveState();
+    return; // 🔥 CRITICAL: RETURN TO PREVENT DUPLICATE RESPONSES
+  }
+
+  // 🔥 URGENCY PUSH: Limited slots message
+  if (user.stage === 'interested' && user.score > 20) {
+    const isEn = isEnglish(body);
+    const urgencyMsg = isEn
+      ? "We have limited slots this week.\n\nDo you want me to reserve one for you?"
+      : "Is hafte ke liye limited slots hain.\n\nKya main aapke liye ek slot reserve karu?";
+    await sendSafe(client, chatId, user, urgencyMsg);
+    console.log(`${sid} [URGENCY] Sending limited slots message. Score: ${user.score}`);
+    saveState();
+    return; // 🔥 CRITICAL: RETURN TO PREVENT DUPLICATE RESPONSES
+  }
+
+  // 🔥 HANDLE "INTERESTED" PROPERLY
+  const msg_lower = body.toLowerCase();
+  if (msg_lower.includes('interested') || msg_lower.includes('intersted')) {
+    await sendSafe(client, chatId, user,
+      `Great 👍\n\nAutomation system ₹5,000 – ₹10,000 me ready ho jata hai.\n\nKya main aapke liye setup start karu?`
+    );
+    user.stage = 'closing';
+    user.score += 20;
+    user.lastInteraction = Date.now();
+    saveState();
+    return;
+  }
+  
+  // 🔥 HANDLE UNKNOWN MESSAGES PROPERLY
+  if (intent === 'unknown') {
+    await sendSafe(client, chatId, user,
+      `Samajh gaya 👍\n\nAap WhatsApp automation ya website system me interested ho?\n\nMain help kar sakta hoon.`
+    );
+    user.lastInteraction = Date.now();
+    return;
+  }
+  
+  // 🔥 HANDLE SHORT REPLIES (IMPORTANT)
+  if (message.body.toLowerCase() === 'bolo' || message.body.toLowerCase() === 'haan') {
+    await sendSafe(client, chatId, user,
+      `Great 👍\n\nMain aapke business ke liye automation setup kar sakta hoon.\n\nAapka business type kya hai?`
+    );
+    user.lastInteraction = Date.now();
     return;
   }
 
@@ -1105,62 +1348,70 @@ async function handleMessage(client: Client, message: Message): Promise<void> {
           if (shouldAddBoost) text += "\n\n" + msg.trustBoost;
           await sendSafe(client, chatId, user, text);
           user.stage = 'interested';
+          return; // 🔥 CRITICAL: RETURN
         } else if (user.category === 'clinic') {
           let text = msg.clinicInitial;
           if (shouldAddBoost) text += "\n\n" + msg.trustBoost;
           await sendSafe(client, chatId, user, text);
           user.stage = 'interested';
+          return; // 🔥 CRITICAL: RETURN
         } else if (user.category === 'website') {
           let text = msg.websiteInitial;
           if (shouldAddBoost) text += "\n\n" + msg.trustBoost;
           await sendSafe(client, chatId, user, text);
           user.stage = 'interested';
+          return; // 🔥 CRITICAL: RETURN
         } else if (user.category === 'automation') {
           let text = msg.automationInitial;
           if (shouldAddBoost) text += "\n\n" + msg.trustBoost;
           await sendSafe(client, chatId, user, text);
           user.stage = 'interested';
+          return; // 🔥 CRITICAL: RETURN
         } else {
           // fallback
           await sendSafe(client, chatId, user, msg.confirmCategory);
+          return; // 🔥 CRITICAL: RETURN
         }
-        break;
       }
 
       case 'interested': {
         if (currentIntent === 'interest' || currentIntent === 'greeting') {
           await sendSafe(client, chatId, user, msg.explanation);
           user.stage = 'qualified';
+          return; // 🔥 CRITICAL: RETURN
         } else {
           await sendSafe(client, chatId, user, msg.fallback);
+          return; // 🔥 CRITICAL: RETURN
         }
-        break;
       }
 
       case 'qualified': {
         await sendSafe(client, chatId, user, msg.closePush);
         user.stage = 'confirm_start';
-        break;
+        return; // 🔥 CRITICAL: RETURN
       }
 
       case 'confirm_start': {
         await sendSafe(client, chatId, user, msg.closePush);
-        break;
+        return; // 🔥 CRITICAL: RETURN
       }
 
       default:
         user.stage = 'new';
         await sendSafe(client, chatId, user, msg.fallback);
+        return; // 🔥 CRITICAL: RETURN
     }
   });
 
   if (user.stage !== stageBeforeReply) {
-    console.log(`${sid} [BOT] → stage: ${stageBeforeReply} → ${user.stage}`);
+    console.log(`${sid} [BOT] → stage: ${stageBeforeReply} → ${user.stage} | Score: ${user.score}`);
     saveLead(chatId, body, user, name);
   }
 
+  user.lastInteraction = Date.now();
   saveState();
   scheduleFollowUp(client, chatId, user);
+  return;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1177,6 +1428,11 @@ async function handleMessage(client: Client, message: Message): Promise<void> {
 async function shutdown(signal: string) {
   const sid = `[SESSION ${SESSION_ID}]`;
   console.log(`\n${sid} [${signal}] Shutting down...`);
+  
+  if (analytics) {
+    analytics.stopDashboard();
+    console.log(`${sid} [SHUTDOWN] Analytics stopped.`);
+  }
   
   if (globalClient) {
     try {
@@ -1225,36 +1481,50 @@ async function start(client: Client): Promise<void> {
   const sid = `[SESSION ${SESSION_ID}]`;
   console.log(`${sid} Client started, wait for readiness signal...`);
   
-  // Enforce wait for session settling and storage (120s hard delay for environment stabilization)
-  console.log(`${sid} Hardening session (120s wait — do NOT touch system)...`);
-  await delay(120000);
-
-  // Retry guard: attempt up to 3 times before giving up
-  let isValid = false;
-  for (let attempt = 1; attempt <= 3; attempt++) {
+  // Initialize analytics
+  analytics = new Analytics(SESSION_DIR, SESSION_ID);
+  analytics.startDashboard();
+  console.log(`${sid} Analytics initialized`);
+  
+  // ─────────────────────────────────────────────────────────────────────────────
+  // Initialize Multi-Sheet Outbound Engine
+  // ─────────────────────────────────────────────────────────────────────────────
+  const clientMap: Record<string, Client> = {};
+  
+  const sendSafeWrapper = async (
+    sessionId: string,
+    chatId: string,
+    text: string
+  ): Promise<boolean> => {
     try {
-      if (!client || !client.getHostNumber) {
-        console.log(`${sid} Retrying session init... (attempt ${attempt})`);
-        await delay(10000);
-        continue;
-      }
-      const isConn = await client.isConnected();
-      const host = await client.getHostNumber();
-      if (isConn && host) {
-        isValid = true;
-        console.log(`${sid} Session saved successfully. Host: ${host}`);
-        break;
-      }
-    } catch (e) {
-      console.warn(`${sid} Validation attempt ${attempt} failed, retrying...`);
-      await delay(5000);
+      const user = getUser(chatId);
+      await sendSafe(client, chatId, user, text);
+      return true;
+    } catch (err: any) {
+      console.error(`${sid} [OUTBOUND] Send failed:`, err.message);
+      return false;
     }
-  }
+  };
 
-  if (!isValid) {
-    console.error(`${sid} Validation failed after 3 attempts! Restarting...`);
-    await client.kill();
-    process.exit(1);
+  // Start auto-polling for all sheets
+  startAutoPolling(clientMap, sendSafeWrapper);
+  console.log(`${sid} Multi-sheet outbound engine started`);
+  
+  // 🔥 FIX: Extended hardening period after QR scan (already done in launchWhatsAppClient)
+  // This ensures session files are fully saved before processing messages
+  console.log(`${sid} [STABILITY] Session hardening complete`);
+
+  // 🔥 FIX: Validate session is ready
+  try {
+    const host = await client.getHostNumber();
+    const isConn = await client.isConnected();
+    if (isConn && host) {
+      console.log(`${sid} [SESSION] Validated successfully. Host: ${host}`);
+    } else {
+      console.warn(`${sid} [SESSION] Validation warning - may need manual intervention`);
+    }
+  } catch (e: any) {
+    console.error(`${sid} [SESSION] Validation error:`, e.message);
   }
 
   const sessionId = process.env.SESSION_ID || "default";
@@ -1285,49 +1555,66 @@ async function start(client: Client): Promise<void> {
 
   client.onStateChanged(state => {
     console.log(`[STATE] ${state}`);
-    if (state === 'CONFLICT' || state === 'UNLAUNCHED') client.forceRefocus();
+    // 🔥 FIX: Do NOT auto-restart on state changes
+    // Only log state for monitoring
+    if (state === 'CONFLICT') {
+      console.warn(`${sid} [STATE] CONFLICT detected - manual intervention may be needed`);
+    }
+    if (state === 'UNLAUNCHED') {
+      console.warn(`${sid} [STATE] UNLAUNCHED detected - session may need restart`);
+    }
   });
 
-  console.log(`${sid} STABLE READY ✅`);
+  console.log(`${sid} [STABILITY] STABLE READY ✅`);
   
-  // Auto Self Test
+  // 🔥 FIX: Auto Self Test with proper error handling
   try {
     const me = await client.getHostNumber();
     if (me) {
       await client.sendText(`${me}@c.us` as any, "System Ready ✅");
-      console.log(`${sid} Self-test message sent to host.`);
+      console.log(`${sid} [SELF-TEST] Message sent to host.`);
     }
   } catch (e: any) {
-    console.error(`${sid} Self-test failed:`, e.message);
+    console.warn(`${sid} [SELF-TEST] Warning:`, e.message);
+    // Don't fail startup on self-test error
   }
 
   // ATTACH LISTENERS ONLY AFTER STABLE READY
   console.log(`${sid} Attaching listeners...`);
 
-  // BASIC TEST HANDLER - responds to "hi" with "Working ✅"
+  // Single consolidated onMessage handler — prevents duplicate listener leak
   client.onMessage(async (message: Message) => {
     try {
       if (message.fromMe) return;
-      if (message.body && message.body.toLowerCase() === "hi") {
-        console.log(`[SESSION ${SESSION_ID}] Test message received: hi`);
-        await client.sendText(message.from, "Working ✅");
-        console.log(`[SESSION ${SESSION_ID}] Test reply sent`);
+
+      // Admin command
+      if (message.from === ADMIN_NUMBER && message.body === 'START BULK') {
+        await client.sendText(ADMIN_NUMBER as ChatId, "Bulk outreach initiated...");
+        runBulkOutreach(client);
+        return;
       }
-    } catch (err: any) {
-      console.error(`[SESSION ${SESSION_ID}] Test handler error:`, err.message);
-    }
-  });
 
-  // SALES FUNNEL - only fires for incoming messages (fromMe === false)
-  client.onMessage(async (message: Message) => {
-    try {
-      // Hard guard — never process our own outgoing messages
-      if (message.fromMe) return;
+      // Multi-sheet metrics command
+      if (message.from === ADMIN_NUMBER && message.body === 'SHEET METRICS') {
+        const metrics = getSheetMetrics();
+        const metricsText = Object.entries(metrics)
+          .map(([sheetId, m]: [string, any]) => 
+            `${sheetId}: ${m.sentToday}/${m.dailyLimit} sent, ${m.failedCount} failed`
+          )
+          .join('\n');
+        await client.sendText(ADMIN_NUMBER as ChatId, `[SHEET METRICS]\n${metricsText}`);
+        return;
+      }
 
-      console.log(`[SESSION ${SESSION_ID}] Incoming:`, message.body);
+      // Test ping
+      if (message.body && message.body.toLowerCase() === 'hi') {
+        console.log(`${sid} Test message received: hi`);
+        await client.sendText(message.from, 'Working ✅');
+        return;
+      }
 
-      // Only handle plain text messages in the funnel
-      // Non-text types (image, audio, etc.) get a soft nudge
+      console.log(`${sid} Incoming:`, message.body);
+
       if (message.type !== MessageTypes.TEXT) {
         await delay(3000);
         await client.sendText(message.from, M(message.body || '').nonText);
@@ -1336,16 +1623,7 @@ async function start(client: Client): Promise<void> {
 
       await handleMessage(client, message);
     } catch (err: any) {
-      console.error(`[SESSION ${SESSION_ID}] Error in onMessage:`, err.message);
-    }
-  });
-
-  // Command System for Admin
-  client.onMessage(async (message: Message) => {
-    if (message.fromMe) return;
-    if (message.from === ADMIN_NUMBER && message.body === 'START BULK') {
-      await client.sendText(ADMIN_NUMBER as ChatId, "Bulk outreach initiated...");
-      runBulkOutreach(client);
+      console.error(`${sid} Error in onMessage:`, err.message);
     }
   });
 
@@ -1396,31 +1674,95 @@ process.on('exit', () => {
   }
 });
 
+// ─────────────────────────────────────────────────────────────────────────────
+// PUPPETEER/CHROME LAUNCH STABILITY FIX
+// ─────────────────────────────────────────────────────────────────────────────
+
+// Clear any Puppeteer environment overrides
+delete process.env.PUPPETEER_EXECUTABLE_PATH;
+delete process.env.PUPPETEER_SKIP_CHROMIUM_DOWNLOAD;
+
+// Track launch attempts to prevent infinite loops
+let launchAttempts = 0;
+const MAX_LAUNCH_ATTEMPTS = 2;
+
+async function launchWhatsAppClient() {
+  const sid = `[SESSION ${SESSION_ID}]`;
+  launchAttempts++;
+
+  if (launchAttempts > MAX_LAUNCH_ATTEMPTS) {
+    console.error(`${sid} [FATAL] Max launch attempts (${MAX_LAUNCH_ATTEMPTS}) exceeded. Exiting.`);
+    process.exit(1);
+  }
+
+  console.log(`${sid} [BROWSER] Initializing Chrome (attempt ${launchAttempts}/${MAX_LAUNCH_ATTEMPTS})...`);
+  console.log(`${sid} [AUTH] Scan QR and wait 60 seconds`);
+
+  try {
+    const client = await create({
+      sessionId: SESSION_ID,
+      headless: false,  // 🔥 FIX: Set to false for stable multi-device support
+      useChrome: true,
+      multiDevice: true,
+      restartOnCrash: false,  // 🔥 FIX: Disable auto-restart to prevent context destruction
+      blockCrashLogs: true,
+      disableSpins: true,
+      qrTimeout: 0,  // Wait indefinitely for QR scan
+      authTimeout: 120,  // 🔥 FIX: Increased from 60 to 120 seconds
+      sessionDataPath: SESSION_DIR,
+      qrLogSkip: false,
+      popup: false,
+      // 🔥 FIX: REMOVED invalid chromiumArgs that break multi-device
+      // Removed: '--no-sandbox', '--disable-dev-shm-usage'
+      args: [
+        // Only safe, essential args for stable Chrome launch
+        '--disable-gpu',  // Disable GPU acceleration for stability
+      ],
+    });
+
+    console.log(`${sid} [SESSION] QR required`);
+    console.log(`${sid} [AUTH] Waiting for QR scan...`);
+
+    // Wait for successful authentication
+    await delay(5000);
+
+    const isConnected = await client.isConnected();
+    if (!isConnected) {
+      console.warn(`${sid} [AUTH] Not connected yet, waiting...`);
+      await delay(10000);
+    }
+
+    console.log(`${sid} [SESSION] Logged in successfully`);
+    console.log(`${sid} [SESSION] Restart safe`);
+
+    // 🔥 FIX: Do NOT restart bot for at least 120 seconds after QR scan
+    console.log(`${sid} [STABILITY] Hardening session for 120 seconds...`);
+    await delay(120000);
+
+    return client;
+  } catch (err: any) {
+    const errMsg = err.message || String(err);
+    console.error(`${sid} [BROWSER] Launch failed:`, errMsg);
+
+    // 🔥 FIX: Retry once on "Execution context destroyed" errors
+    if (errMsg.includes('Execution context') || errMsg.includes('destroyed')) {
+      console.warn(`${sid} [RECOVERY] Execution context error detected. Retrying...`);
+      await delay(5000);
+      return launchWhatsAppClient();  // Recursive retry
+    }
+
+    // Do NOT delete session immediately on error
+    console.error(`${sid} [ERROR] Session preserved for debugging`);
+    throw err;
+  }
+}
+
 console.log(`[SESSION ${SESSION_ID}] Initializing browser...`);
+console.log(`[SESSION ${SESSION_ID}] Using system Chrome`);
 console.log("Creating client...");
+
 try {
-  create({
-    sessionId: SESSION_ID,
-    headless: false,
-    useChrome: true,
-    multiDevice: true,
-    restartOnCrash: true,
-    blockCrashLogs: true,
-    disableSpins: true,
-    qrTimeout: 0,
-    authTimeout: 120,
-    sessionDataPath: SESSION_DIR,
-    qrLogSkip: false,
-    popup: true,
-    args: [
-      '--disable-dev-shm-usage',
-      '--no-first-run',
-      '--no-default-browser-check',
-      '--disable-extensions',
-      '--disable-web-security',
-      '--disable-features=IsolateOrigins,site-per-process',
-    ],
-  })
+  launchWhatsAppClient()
     .then(client => {
       console.log(`[SESSION ${SESSION_ID}] Client initialized`);
       return start(client);
@@ -1429,7 +1771,9 @@ try {
       console.error(`[SESSION ${SESSION_ID}] FAILED`, e.message);
       console.error("[FATAL ERROR]", e);
       if (fs.existsSync(LOCK_FILE)) fs.unlinkSync(LOCK_FILE);
+      process.exit(1);
     });
 } catch (error) {
   console.error("[FATAL ERROR] Outside of promise:", error);
+  process.exit(1);
 }

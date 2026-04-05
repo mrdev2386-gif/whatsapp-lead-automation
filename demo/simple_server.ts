@@ -1,7 +1,6 @@
 //Please see these docs: https://open-wa.github.io/wa-automate-nodejs/classes/client.html#middleware
 
-// import { create, Client } from '@open-wa/wa-automate';
-import { create, Client } from '../src/index';
+import { create, Client } from '@open-wa/wa-automate';
 const axios = require('axios').default;
 
 const { default: PQueue } = require("p-queue");
@@ -15,11 +14,11 @@ const PORT = 8082;
 //Create your webhook here: https://webhook.site/
 const WEBHOOK_ADDRESS = 'PASTE_WEBHOOK_DOT_SITE_UNIQUE_URL_HERE'
 
-async function fire(data){
+async function fire(data: any){
     return await axios.post(WEBHOOK_ADDRESS, data)
 }
 
-const wh = event => async (data) => {
+const wh = (event: string) => async (data: any) => {
     const ts = Date.now();
     return await queue.add(()=>fire({
         ts,
@@ -28,7 +27,7 @@ const wh = event => async (data) => {
     }))
 }
 
-async function start(client:Client){
+async function start(client: Client){
   app.use(client.middleware);
   client.onAck(wh('ack'))
   client.onAnyMessage(wh('any_message'))
@@ -54,7 +53,7 @@ async function start(client:Client){
 create({
     sessionId:'session1'
 })
-  .then(async client => await start(client))
-  .catch(e=>{
+  .then(async (client: any) => await start(client))
+  .catch((e: any)=>{
     console.log('Error',e.message);
   });
