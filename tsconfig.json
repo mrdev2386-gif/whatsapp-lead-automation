@@ -16,5 +16,5 @@
     "sourceMap": true
   },
   "include": ["demo/**/*.ts"],
-  "exclude": ["node_modules", "dist"]
+  "exclude": ["node_modules", "dist", "demo/dist", "**/*.md", "demo/index-old.ts", "demo/message_queue.ts", "demo/outbound-integration.ts", "demo/server.ts", "demo/simple_server.ts"]
 }
