@@ -52,18 +52,6 @@ const SHEET_CONFIGS: SheetConfig[] = [
     sessionId: '9155604591',
     spreadsheetId: '1EX1deJaPlYOqv45d7lMmW552g9vvFh6cESG3CMl9tFQ',
     sheetName: 'Leads_9155604591'
-  },
-  {
-    sheetId: 'sheet2',
-    sessionId: '9155604591',
-    spreadsheetId: '10YUi0tNUpj4GqaCf2-ZWyJ9APiizb6JDrNry5dSzv20',
-    sheetName: 'Leads_9508310294'
-  },
-  {
-    sheetId: 'sheet3',
-    sessionId: '9155604591',
-    spreadsheetId: '1stbRPi4uffSHCMzQEcMVxf5f5w47kDYSVYYkG6YX874',
-    sheetName: 'Leads_6299261088'
   }
 ];
 

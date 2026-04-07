@@ -243,16 +243,26 @@ export async function initBaileysClient(sessionId: string): Promise<BaileysClien
 
   sock.ev.on('messages.upsert', async (m) => {
     try {
+      console.log('[AI] Message event triggered');
       const msg = m.messages[0];
-      if (!msg.message) return;
-      if (msg.key.fromMe) return;
+      if (!msg.message) {
+        console.log('[AI] No message content');
+        return;
+      }
+      if (msg.key.fromMe) {
+        console.log('[AI] Ignoring own message');
+        return;
+      }
 
       const from = msg.key.remoteJid || '';
+      console.log('[AI] Raw JID:', from);
       const normalizedFrom = from.replace('@s.whatsapp.net', '@c.us');
+      console.log('[AI] Normalized JID:', normalizedFrom);
+      console.log('[AI] Contacted users:', Array.from(contactedUsers));
       
       // Only reply to contacted users
       if (!contactedUsers.has(normalizedFrom)) {
-        console.log('[AI] Ignoring:', normalizedFrom);
+        console.log('[AI] Ignored:', normalizedFrom);
         return;
       }
 
@@ -261,25 +271,33 @@ export async function initBaileysClient(sessionId: string): Promise<BaileysClien
         msg.message.extendedTextMessage?.text ||
         '';
 
-      if (!text.trim()) return;
+      if (!text.trim()) {
+        console.log('[AI] Empty message text');
+        return;
+      }
 
-      console.log('[AI] Incoming from', normalizedFrom, ':', text);
+      console.log('[AI] Message:', text);
 
       // Human-like delay (4-8 seconds)
       const delay = Math.floor(Math.random() * (8 - 4 + 1)) + 4;
+      console.log('[AI] Waiting', delay, 'seconds...');
       await new Promise(r => setTimeout(r, delay * 1000));
 
       // Generate AI reply
+      console.log('[AI] Calling OpenAI...');
       const reply = await generateAIReply(text);
+      console.log('[AI] Reply:', reply);
       
       // Send reply
+      console.log('[AI] Sending reply to', normalizedFrom);
       await sock.sendMessage(normalizedFrom, { text: reply });
-      console.log('[AI] Replied to', normalizedFrom);
+      console.log('[AI] ✓ Replied');
 
       // Schedule follow-up
       scheduleFollowUp(normalizedFrom, sock);
     } catch (err: any) {
-      console.error('[AI] Error processing message:', err.message);
+      console.error('[AI] Error:', err.message);
+      if (err.stack) console.error(err.stack);
     }
   });
 
