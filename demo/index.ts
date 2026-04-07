@@ -1,13 +1,13 @@
+import * as dotenv from "dotenv";
+dotenv.config();
+
 console.log("[BOOT] Baileys WhatsApp Automation Started");
 
-import * as dotenv from "dotenv";
 import * as fs from "fs";
 import * as path from "path";
 import { initBaileysClient } from "./baileys-client";
 import { startAutoPolling } from "./multi-sheet-engine";
 import { fixSheetStructure } from "./google-sheets-api";
-
-dotenv.config();
 
 const SESSION_ID = process.env.SESSION_ID || "9155604591";
 const SESSION_DIR = path.join(process.cwd(), `wa-${SESSION_ID}`);
@@ -64,6 +64,8 @@ async function main() {
     ): Promise<boolean> => {
       try {
         await client.sendMessage(chatId, text);
+        // Track as contacted user for AI replies
+        client.addContactedUser(chatId);
         return true;
       } catch (err: any) {
         console.error(`[OUTBOUND] Send failed:`, err.message);
